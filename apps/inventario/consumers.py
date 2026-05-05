@@ -1,0 +1,72 @@
+"""
+WebSocket consumer para alertas de stock crítico en tiempo real.
+Equivalente al WebSocket /inventario/ws/alertas del microservicio Chem Movid.
+"""
+import asyncio
+import json
+from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.db import database_sync_to_async
+from django.db.models import F, ExpressionWrapper, FloatField
+from .models import Articulo
+
+
+class AlertasStockConsumer(AsyncWebsocketConsumer):
+
+    async def connect(self):
+        await self.channel_layer.group_add('alertas_stock', self.channel_name)
+        await self.accept()
+        # Enviar alertas iniciales al conectar
+        alertas = await self._get_alertas()
+        await self.send(text_data=json.dumps({'tipo': 'alertas_stock', 'data': alertas}))
+        # Iniciar loop de 30 segundos
+        self._loop_task = asyncio.create_task(self._periodic_push())
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard('alertas_stock', self.channel_name)
+        if hasattr(self, '_loop_task'):
+            self._loop_task.cancel()
+
+    async def receive(self, text_data=None, bytes_data=None):
+        if text_data == 'ping':
+            alertas = await self._get_alertas()
+            await self.send(text_data=json.dumps({'tipo': 'alertas_stock', 'data': alertas}))
+
+    async def alertas_stock_message(self, event):
+        await self.send(text_data=json.dumps(event['data']))
+
+    async def _periodic_push(self):
+        while True:
+            await asyncio.sleep(30)
+            try:
+                alertas = await self._get_alertas()
+                await self.send(text_data=json.dumps({'tipo': 'alertas_stock', 'data': alertas}))
+            except Exception:
+                break
+
+    @database_sync_to_async
+    def _get_alertas(self):
+        qs = (
+            Articulo.objects.filter(activo=True, stock_minimo__gt=0)
+            .filter(stock_actual__lte=F('stock_minimo'))
+            .annotate(
+                porcentaje_stock=ExpressionWrapper(
+                    F('stock_actual') * 100.0 / (F('stock_minimo') + 0.001),
+                    output_field=FloatField()
+                )
+            )
+            .order_by('porcentaje_stock')
+        )
+        return [
+            {
+                'articulo_id': a.id,
+                'codigo': a.codigo,
+                'descripcion': a.descripcion,
+                'categoria': a.categoria,
+                'unidad_medida': a.unidad_medida,
+                'stock_actual': float(a.stock_actual),
+                'stock_minimo': float(a.stock_minimo),
+                'porcentaje_stock': round(float(a.porcentaje_stock), 2),
+                'nivel_urgencia': 'critico' if float(a.porcentaje_stock) <= 50 else 'bajo',
+            }
+            for a in qs
+        ]

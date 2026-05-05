@@ -1,0 +1,7 @@
+from django.urls import path
+from .views import OrdenCompraListView, OrdenCompraDetailView
+
+urlpatterns = [
+    path('ordenes/', OrdenCompraListView.as_view()),
+    path('ordenes/<int:pk>/', OrdenCompraDetailView.as_view()),
+]
