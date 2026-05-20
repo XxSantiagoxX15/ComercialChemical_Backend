@@ -1,9 +1,12 @@
 from rest_framework import serializers
+from django.db.models import Sum
 from .models import Articulo, MovimientoInventario, Kit, KitComponente
 
 
 class ArticuloSerializer(serializers.ModelSerializer):
     en_stock_critico = serializers.BooleanField(read_only=True)
+    total_vendido    = serializers.SerializerMethodField()
+    valor_vendido    = serializers.SerializerMethodField()
 
     class Meta:
         model = Articulo
@@ -11,9 +14,20 @@ class ArticuloSerializer(serializers.ModelSerializer):
             'id', 'codigo', 'descripcion', 'categoria', 'unidad_medida',
             'stock_actual', 'stock_minimo', 'stock_maximo',
             'tiempo_reposicion_dias', 'activo',
-            'en_stock_critico', 'fecha_creacion', 'fecha_modificacion'
+            'en_stock_critico', 'total_vendido', 'valor_vendido',
+            'fecha_creacion', 'fecha_modificacion'
         ]
         read_only_fields = ['id', 'stock_actual', 'fecha_creacion', 'fecha_modificacion']
+
+    def get_total_vendido(self, obj):
+        result = obj.ventas.aggregate(total=Sum('cantidad_vendida'))
+        total = result.get('total')
+        return float(total) if total is not None else 0.0
+
+    def get_valor_vendido(self, obj):
+        result = obj.ventas.aggregate(total=Sum('valor_total'))
+        total = result.get('total')
+        return float(total) if total is not None else 0.0
 
 
 class MovimientoInventarioSerializer(serializers.ModelSerializer):

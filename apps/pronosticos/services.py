@@ -26,24 +26,26 @@ def _get_serie(articulo_id: int) -> pd.Series | None:
 
 def calcular_prediccion(articulo_id: int, modelo: str = 'suavizacion_exponencial', periodos: int = 3) -> dict:
     """
-    Portado de Chem Movid forecasting/engine/*.py
-    Modelos soportados:
-      - suavizacion_exponencial  (mín. 12 períodos)
-      - arima                    (mín. 36 períodos)
-      - regresion_minimos_cuadrados (mín. 12 períodos)
+    Motor de forecasting — funciona con cualquier cantidad de datos históricos.
+    - 1 período: proyección lineal simple (promedio constante)
+    - 2 períodos: regresión lineal simple
+    - 3+ períodos: SimpleExpSmoothing
+    - 12+ períodos: Holt-Winters (más preciso)
+    - ARIMA requiere mínimo 12 períodos
     """
     serie = _get_serie(articulo_id)
-    if serie is None or len(serie) < 12:
+
+    if serie is None or len(serie) == 0:
         return {
-            'error': 'Datos insuficientes (se requieren al menos 12 meses de historial)',
-            'periodos_disponibles': len(serie) if serie is not None else 0,
+            'error': 'Este artículo no tiene historial de ventas registrado.',
+            'periodos_disponibles': 0,
         }
 
-    if modelo == 'arima' and len(serie) < 36:
+    if modelo == 'arima' and len(serie) < 12:
         return {
-            'error': 'ARIMA requiere mínimo 36 períodos mensuales',
+            'error': 'ARIMA requiere mínimo 12 períodos mensuales',
             'periodos_disponibles': len(serie),
-            'periodos_faltantes': 36 - len(serie),
+            'periodos_faltantes': 12 - len(serie),
         }
 
     valores = serie.values.astype(float)
@@ -51,11 +53,29 @@ def calcular_prediccion(articulo_id: int, modelo: str = 'suavizacion_exponencial
     params = {}
 
     try:
+        n = len(valores)
+
         if modelo == 'suavizacion_exponencial':
-            from statsmodels.tsa.holtwinters import ExponentialSmoothing
-            fit = ExponentialSmoothing(valores, trend='add', seasonal=None).fit()
-            forecast = np.maximum(fit.forecast(periodos), 0)
-            params = {'alpha': round(float(fit.params.get('smoothing_level', 0)), 4)}
+            if n >= 12:
+                from statsmodels.tsa.holtwinters import ExponentialSmoothing
+                fit = ExponentialSmoothing(valores, trend='add', seasonal=None).fit()
+                forecast = np.maximum(fit.forecast(periodos), 0)
+                params = {'alpha': round(float(fit.params.get('smoothing_level', 0)), 4), 'metodo': 'Holt-Winters'}
+            elif n >= 3:
+                from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+                fit = SimpleExpSmoothing(valores).fit(optimized=True)
+                forecast = np.maximum(fit.forecast(periodos), 0)
+                params = {'alpha': round(float(fit.params.get('smoothing_level', 0)), 4), 'metodo': 'Simple'}
+            elif n == 2:
+                # Regresión lineal con 2 puntos
+                pendiente = float(valores[1] - valores[0])
+                base = float(valores[-1])
+                forecast = np.array([max(base + pendiente * (i + 1), 0) for i in range(periodos)])
+                params = {'metodo': 'Lineal simple', 'pendiente': round(pendiente, 3)}
+            else:
+                # 1 punto: promedio constante
+                forecast = np.full(periodos, max(float(valores[0]), 0))
+                params = {'metodo': 'Promedio constante', 'valor_base': round(float(valores[0]), 3)}
 
         elif modelo == 'arima':
             from statsmodels.tsa.arima.model import ARIMA
@@ -64,11 +84,15 @@ def calcular_prediccion(articulo_id: int, modelo: str = 'suavizacion_exponencial
             params = {'order': '(1,1,1)', 'aic': round(float(fit.aic), 2)}
 
         elif modelo == 'regresion_minimos_cuadrados':
-            x = np.arange(len(valores))
-            coef = np.polyfit(x, valores, 1)
-            x_fut = np.arange(len(valores), len(valores) + periodos)
-            forecast = np.maximum(np.polyval(coef, x_fut), 0)
-            params = {'pendiente': round(float(coef[0]), 4), 'intercepto': round(float(coef[1]), 4)}
+            if n >= 2:
+                x = np.arange(n)
+                coef = np.polyfit(x, valores, 1)
+                x_fut = np.arange(n, n + periodos)
+                forecast = np.maximum(np.polyval(coef, x_fut), 0)
+                params = {'pendiente': round(float(coef[0]), 4), 'intercepto': round(float(coef[1]), 4)}
+            else:
+                forecast = np.full(periodos, max(float(valores[0]), 0))
+                params = {'metodo': 'Promedio constante'}
 
         else:
             return {'error': f'Modelo no soportado: {modelo}'}
@@ -87,13 +111,15 @@ def calcular_prediccion(articulo_id: int, modelo: str = 'suavizacion_exponencial
                 fecha_prediccion=fecha.date(),
                 defaults={'demanda_proyectada': max(float(valor), 0), 'parametros_modelo': params}
             )
-            predicciones.append({'fecha': fecha.strftime('%Y-%m-%d'),
-                                  'demanda_proyectada': round(max(float(valor), 0), 3)})
+            predicciones.append({
+                'fecha': fecha.strftime('%Y-%m-%d'),
+                'demanda_proyectada': round(max(float(valor), 0), 3)
+            })
 
         return {
             'articulo_id': articulo_id,
             'modelo': modelo,
-            'periodos_historicos': len(serie),
+            'periodos_historicos': n,
             'predicciones': predicciones,
             'parametros': params,
         }

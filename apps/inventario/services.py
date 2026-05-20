@@ -12,7 +12,7 @@ class ArticuloService:
 
     @staticmethod
     def listar(buscar=None, categoria=None, page=1, limit=50):
-        qs = Articulo.objects.filter(activo=True)
+        qs = Articulo.objects.filter(activo=True).prefetch_related('ventas')
         if buscar:
             qs = qs.filter(descripcion__icontains=buscar) | qs.filter(codigo__icontains=buscar)
         if categoria:

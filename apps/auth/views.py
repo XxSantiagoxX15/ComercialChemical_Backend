@@ -39,6 +39,87 @@ def _get_client_ip(request) -> str:
     return request.META.get('REMOTE_ADDR', 'unknown')
 
 
+class RolListView(APIView):
+    permission_classes = [IsAdmin]
+
+    def get(self, request):
+        roles = Rol.objects.all()
+        from .serializers import RolSerializer
+        return Response(RolSerializer(roles, many=True).data)
+
+
+class PermisosRolView(APIView):
+    """GET /api/auth/permisos/ → todos los permisos por rol
+       PUT /api/auth/permisos/ → actualizar permisos de un rol"""
+    permission_classes = [IsAdmin]
+
+    MODULOS_DEFAULT = {
+        'Administrador': [
+            'dashboard','inventario_articulos','inventario_movimientos',
+            'inventario_alertas','compras','pronosticos',
+            'importacion','auditoria','usuarios'
+        ],
+        'Analista_Inventarios': [
+            'dashboard','inventario_articulos','inventario_movimientos',
+            'inventario_alertas','pronosticos'
+        ],
+        'Responsable_Compras': [
+            'dashboard','compras','inventario_alertas','pronosticos'
+        ],
+    }
+
+    def _inicializar_permisos(self):
+        """Crea los permisos por defecto si no existen."""
+        from .models import PermisoRol
+        todos_modulos = [m[0] for m in PermisoRol.MODULOS]
+        for rol in Rol.objects.all():
+            defaults = self.MODULOS_DEFAULT.get(rol.nombre, [])
+            for modulo in todos_modulos:
+                PermisoRol.objects.get_or_create(
+                    rol=rol, modulo=modulo,
+                    defaults={'activo': modulo in defaults}
+                )
+
+    def get(self, request):
+        from .models import PermisoRol
+        self._inicializar_permisos()
+        roles = Rol.objects.prefetch_related('permisos').all()
+        resultado = []
+        for rol in roles:
+            permisos = {p.modulo: p.activo for p in rol.permisos.all()}
+            resultado.append({
+                'rol_id': rol.id,
+                'rol_nombre': rol.nombre,
+                'descripcion': rol.descripcion,
+                'permisos': permisos,
+            })
+        return Response(resultado)
+
+    def put(self, request):
+        from .models import PermisoRol
+        rol_id  = request.data.get('rol_id')
+        permisos = request.data.get('permisos', {})
+        try:
+            rol = Rol.objects.get(id=rol_id)
+        except Rol.DoesNotExist:
+            return Response({'error': 'Rol no encontrado'}, status=404)
+        if rol.nombre == 'Administrador':
+            return Response({'error': 'No se pueden modificar los permisos del Administrador'}, status=400)
+        for modulo, activo in permisos.items():
+            PermisoRol.objects.update_or_create(
+                rol=rol, modulo=modulo,
+                defaults={'activo': bool(activo)}
+            )
+        registrar_evento(
+            'ACTUALIZAR_PERMISOS',
+            f'Permisos del rol {rol.nombre} actualizados',
+            usuario_id=request.auth.get('usuario_id') if request.auth else None,
+            entidad='rol', entidad_id=rol_id,
+            ip=_get_client_ip(request),
+        )
+        return Response({'message': f'Permisos de {rol.nombre} actualizados'})
+
+
 class HealthView(APIView):
     permission_classes = []
 
