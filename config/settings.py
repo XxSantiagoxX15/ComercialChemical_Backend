@@ -6,12 +6,20 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-cambiar-en-produccion-chem-modinv-2024')
-DEBUG = os.environ.get('DEBUG', 'True') == 'True'
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'django-insecure-dev-only-not-for-production'
+    else:
+        raise ImproperlyConfigured('SECRET_KEY debe definirse en las variables de entorno en producción (DEBUG=False).')
+
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 INSTALLED_APPS = [
@@ -106,6 +114,14 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': os.environ.get('THROTTLE_RATE_ANON', '20/min'),
+        'user': os.environ.get('THROTTLE_RATE_USER', '120/min'),
+    },
 }
 
 # ─── JWT ──────────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ Fuente: Chem Movid backend/auth/main.py
 """
 import uuid
 import bcrypt
+import logging
 from datetime import datetime, timezone, timedelta
 
 from django.conf import settings
@@ -21,6 +22,8 @@ from .serializers import (
 )
 from .permissions import IsAdmin
 from apps.auditoria.services import registrar_evento
+
+logger = logging.getLogger(__name__)
 
 
 def _hash_password(plain: str) -> str:
@@ -222,15 +225,16 @@ class LoginView(APIView):
 class LogoutView(APIView):
     @extend_schema(description='Cierra sesión e invalida el token JWT.')
     def post(self, request):
+        token = request.auth
+        usuario_id = token.get('usuario_id') if token else None
         try:
-            token = request.auth
             if token:
                 jti = token.get('jti')
                 SesionJWT.objects.filter(token_jti=jti).delete()
                 RefreshToken(str(token)).blacklist()
         except Exception:
-            pass
-        registrar_evento('LOGOUT', f'Cierre de sesión', usuario_id=None, ip=_get_client_ip(request))
+            logger.exception('Error al invalidar el token JWT en logout (usuario_id=%s)', usuario_id)
+        registrar_evento('LOGOUT', 'Cierre de sesión', usuario_id=usuario_id, ip=_get_client_ip(request))
         return Response({'message': 'Sesión cerrada exitosamente'})
 
 

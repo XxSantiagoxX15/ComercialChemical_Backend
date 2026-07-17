@@ -2,6 +2,7 @@ from rest_framework import serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from apps.auth.permissions import IsAdmin
+from apps.common import get_pagination_params
 from .models import EventoAuditoria
 
 
@@ -17,8 +18,7 @@ class AuditoriaListView(APIView):
     def get(self, request):
         tipo = request.query_params.get('tipo_accion')
         usuario_id = request.query_params.get('usuario_id')
-        page = int(request.query_params.get('page', 1))
-        limit = min(int(request.query_params.get('limit', 50)), 200)
+        page, limit = get_pagination_params(request, default_limit=50, max_limit=200)
 
         qs = EventoAuditoria.objects.all()
         if tipo:

@@ -34,6 +34,11 @@ class _TokenUser:
         return self._token.get('usuario_id')
 
     @property
+    def pk(self):
+        # DRF's UserRateThrottle (y otras utilidades) esperan .pk en el user.
+        return self.id
+
+    @property
     def email(self):
         return self._token.get('email', '')
 

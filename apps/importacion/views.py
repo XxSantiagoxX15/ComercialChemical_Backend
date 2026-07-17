@@ -22,7 +22,7 @@ from rest_framework.views import APIView
 
 from apps.auth.permissions import IsAdmin, IsAdminOrInventario
 from apps.inventario.models import Articulo
-from apps.ventas.models import Importacion, VentaHistorico
+from apps.ventas.models import Importacion, VentaHistorico, SaldoHistorico
 
 
 # ── Serializers ────────────────────────────────────────────────────────────────
@@ -51,36 +51,26 @@ def _norm(s) -> str:
     ).upper().strip()
 
 
-def _leer_dataframe(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """
-    Detecta automáticamente la fila de encabezado en el Excel.
-    Devuelve un DataFrame con columnas normalizadas (sin tildes, mayúsculas).
-    """
+def _leer_raw(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Lee el archivo completo SIN encabezado (todas las columnas quedan indexadas
+    0,1,2...) para poder parsear manualmente reportes jerárquicos fila por fila."""
     ext = filename.lower().rsplit('.', 1)[-1]
     engine = 'openpyxl' if ext == 'xlsx' else 'xlrd' if ext == 'xls' else None
-
-    HEADER_KEYWORDS = {
-        'CODIGO', 'CODIGO ARTICULO', 'CODIGO ITEM',
-        'NOMBRE', 'CANTIDAD', 'VALOR', 'SUCURSAL',
-        'CLIENTE', 'IDENTIFICACION', 'CONTEO 1', 'UNI',
-        'DOC NO', 'MARCA', 'FECHA',
-    }
-
     if engine:
-        raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine=engine)
-        best_row, best_score = None, 0
-        for i, row in raw.iterrows():
-            vals = {_norm(v) for v in row if pd.notna(v) and str(v).strip()}
-            score = len(vals & HEADER_KEYWORDS)
-            if score > best_score:
-                best_score, best_row = score, i
-        header = best_row if (best_row is not None and best_score >= 2) else 0
-        df = pd.read_excel(io.BytesIO(file_bytes), header=header, engine=engine)
-    else:
-        df = pd.read_csv(io.BytesIO(file_bytes), encoding='utf-8-sig')
+        return pd.read_excel(io.BytesIO(file_bytes), header=None, engine=engine)
+    return pd.read_csv(io.BytesIO(file_bytes), header=None, encoding='utf-8-sig')
 
-    df.columns = [_norm(c) for c in df.columns]
-    return df.dropna(how='all')
+
+def _encontrar_fila_header(df: pd.DataFrame, keywords_requeridas: set, max_filas: int = 15) -> int:
+    """Busca la primera fila (entre las primeras max_filas) cuyas celdas contengan
+    todas las keywords_requeridas (normalizadas). Los reportes traen unas filas de
+    título/metadata antes del encabezado real de columnas."""
+    limite = min(max_filas, len(df))
+    for i in range(limite):
+        vals = {_norm(v) for v in df.iloc[i] if pd.notna(v) and str(v).strip()}
+        if keywords_requeridas <= vals:
+            return i
+    return 0
 
 
 def _safe_float(val) -> float | None:
@@ -93,20 +83,20 @@ def _safe_float(val) -> float | None:
         return None
 
 
-def _extraer_fecha_encabezado(file_bytes: bytes, ext: str):
-    """Busca 'VENTAS DEL dd/mm/yyyy AL dd/mm/yyyy' en las primeras filas."""
+def _parse_fecha(val):
+    """Parsea una celda de fecha, ya venga como Timestamp/datetime (Excel la
+    tipó como fecha) o como texto 'dd/mm/yyyy'."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if hasattr(val, 'date') and callable(getattr(val, 'date')):
+        try:
+            return val.date()
+        except Exception:
+            pass
     try:
-        engine = 'openpyxl' if ext == 'xlsx' else 'xlrd'
-        raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine=engine)
-        for _, row in raw.iterrows():
-            for val in row:
-                if pd.notna(val) and 'VENTAS DEL' in str(val).upper():
-                    fechas = re.findall(r'(\d{2}/\d{2}/\d{4})', str(val))
-                    if fechas:
-                        return pd.to_datetime(fechas[-1], dayfirst=True).date()
+        return pd.to_datetime(str(val), dayfirst=True).date()
     except Exception:
-        pass
-    return None
+        return None
 
 
 # ── Vista principal ────────────────────────────────────────────────────────────
@@ -117,7 +107,7 @@ class ImportacionUploadView(APIView):
 
     @extend_schema(
         description=(
-            'Sube un archivo Excel/CSV de Toma de Inventario o Ventas por Cliente. '
+            'Sube un archivo Excel/CSV de Saldos vs Existencias Mínimas o Kardex. '
             'Los datos anteriores del mismo tipo se reemplazan automáticamente.'
         )
     )
@@ -127,7 +117,7 @@ class ImportacionUploadView(APIView):
 
         if not file:
             return Response({'error': 'Archivo requerido.'}, status=400)
-        if tipo_informe not in ('Informe_Toma_Inventario', 'Informe_Ventas_Cliente'):
+        if tipo_informe not in ('Informe_Saldos_Existencias_Minimas', 'Informe_Kardex'):
             return Response({'error': 'tipo_informe inválido.'}, status=400)
 
         filename = file.name
@@ -135,7 +125,7 @@ class ImportacionUploadView(APIView):
         file_bytes = file.read()
 
         try:
-            df = _leer_dataframe(file_bytes, filename)
+            df = _leer_raw(file_bytes, filename)
         except Exception as e:
             return Response({'error': f'No se pudo leer el archivo: {e}'}, status=400)
 
@@ -146,15 +136,15 @@ class ImportacionUploadView(APIView):
             # ── REEMPLAZAR datos anteriores del mismo tipo ─────────────────────
             importaciones_anteriores = Importacion.objects.filter(tipo_informe=tipo_informe)
 
-            if tipo_informe == 'Informe_Ventas_Cliente':
+            if tipo_informe == 'Informe_Kardex':
                 VentaHistorico.objects.filter(
                     importacion__in=importaciones_anteriores
                 ).delete()
                 VentaHistorico.objects.filter(importacion__isnull=True).delete()
+                SaldoHistorico.objects.all().delete()
 
-            if tipo_informe == 'Informe_Toma_Inventario':
+            if tipo_informe == 'Informe_Saldos_Existencias_Minimas':
                 # Limpiar artículos con código float antes de reimportar
-                from django.db.models import Q
                 arts_float = Articulo.objects.filter(codigo__regex=r'^\d+\.\d+$')
                 for art_f in arts_float:
                     try:
@@ -172,14 +162,11 @@ class ImportacionUploadView(APIView):
             importaciones_anteriores.delete()
 
             # ── Procesar nuevo archivo ─────────────────────────────────────────
-            if tipo_informe == 'Informe_Toma_Inventario':
-                procesados, errores = self._procesar_toma_inventario(df)
+            if tipo_informe == 'Informe_Saldos_Existencias_Minimas':
+                procesados, errores = self._procesar_saldos_existencias_minimas(df)
 
-            else:  # Informe_Ventas_Cliente
-                fecha_default = _extraer_fecha_encabezado(file_bytes, ext)
-                procesados, errores, articulos_creados = self._procesar_ventas_cliente(
-                    df, fecha_default
-                )
+            else:  # Informe_Kardex
+                procesados, errores = self._procesar_kardex(df)
 
         resultado = 'exito' if not errores else ('parcial' if procesados > 0 else 'error')
         imp = Importacion.objects.create(
@@ -192,9 +179,10 @@ class ImportacionUploadView(APIView):
             reporte_errores=errores or None,
         )
 
-        # Asociar ventas recién creadas a esta importación
-        if tipo_informe == 'Informe_Ventas_Cliente':
+        # Asociar ventas y saldos recién creados a esta importación
+        if tipo_informe == 'Informe_Kardex':
             VentaHistorico.objects.filter(importacion__isnull=True).update(importacion=imp)
+            SaldoHistorico.objects.filter(importacion__isnull=True).update(importacion=imp)
 
         return Response({
             **ImportacionSerializer(imp).data,
@@ -207,234 +195,190 @@ class ImportacionUploadView(APIView):
 
     # ── Procesadores ──────────────────────────────────────────────────────────
 
-    def _procesar_toma_inventario(self, df: pd.DataFrame):
+    def _procesar_saldos_existencias_minimas(self, df: pd.DataFrame):
         """
-        Parsea el Informe de Toma de Inventario de Comercial Chemical.
+        Parsea el Informe "Saldos vs Existencias Mínimas" de Comercial Chemical.
 
-        Estructura del Excel (sin encabezado fijo por bodega):
-          CÓDIGO | CÓDIGO BARRAS | NOMBRE | UNI | CONTEO 1 | CONTEO 2
+        Estructura del Excel (jerárquico por bodega, sin encabezado fijo):
+          CÓDIGO | NOMBRE | UNI | EXISTENCIA MINIMA | SALDO | CANTIDAD A REORDENAR | COSTO TOTAL
 
-        El mismo artículo puede aparecer en múltiples bodegas.
-        Estrategia: consolidar por código sumando los conteos de todas las bodegas.
-        También captura GRUPO como categoría.
+        El mismo artículo puede aparecer en múltiples bodegas. Estrategia:
+        consolidar por código sumando el saldo (stock total real) de todas las
+        bodegas, y tomando la existencia mínima más alta configurada.
         """
-        # ── Paso 1: leer el raw sin encabezado para capturar BODEGA y GRUPO ──
-        # El df ya viene con encabezado detectado. Necesitamos rastrear
-        # las filas de contexto (BODEGA:, GRUPO:) que están en la columna CODIGO.
-
-        # Acumular: { codigo: { nombre, uni, stock_total, categoria } }
+        header_idx = _encontrar_fila_header(df, {'CODIGO', 'NOMBRE', 'SALDO'})
         consolidado: dict = {}
-        categoria_actual = ''
 
-        for i, row in df.iterrows():
-            raw_codigo = row.get('CODIGO', row.get('CODIGO BARRAS', ''))
+        for i in range(header_idx + 1, len(df)):
+            row = df.iloc[i]
+            raw_codigo = row[0]
+            if pd.isna(raw_codigo):
+                continue
             codigo_str = str(raw_codigo).strip()
-
-            if not codigo_str or codigo_str.lower() in ('nan', '', 'none'):
-                # Puede ser fila de GRUPO en otra columna
-                # Buscar en todas las columnas si hay texto de GRUPO
-                for col_val in row:
-                    val_str = str(col_val).strip()
-                    if val_str.upper().startswith('GRUPO:'):
-                        # Extraer nombre del grupo: "GRUPO: 001 COSMETICOS" → "COSMETICOS"
-                        partes = val_str.split(' ', 2)
-                        if len(partes) >= 3:
-                            # Quitar número: "001 COSMETICOS" → "COSMETICOS"
-                            grupo_parts = partes[2].split(' ', 1)
-                            if len(grupo_parts) >= 2 and grupo_parts[0].isdigit():
-                                categoria_actual = grupo_parts[1].title()
-                            else:
-                                categoria_actual = partes[2].title()
-                        break
+            if not codigo_str:
                 continue
 
             codigo_norm = _norm(codigo_str)
-
-            # Ignorar filas de encabezado/subtotal/bodega/grupo
-            if any(codigo_norm.startswith(p) for p in (
-                'SUBTOTAL', 'TOTAL', 'BODEGA', 'GRUPO', 'SUBGRUPO',
-                'INVENTARIOS', 'MERCANCIAS', 'CODIGO', 'FECHA',
-            )):
-                # Detectar GRUPO en la columna CODIGO también
-                if codigo_norm.startswith('GRUPO:') or 'GRUPO:' in codigo_norm:
-                    partes = codigo_str.split(' ', 2)
-                    if len(partes) >= 3:
-                        grupo_parts = partes[2].split(' ', 1)
-                        if len(grupo_parts) >= 2 and grupo_parts[0].isdigit():
-                            categoria_actual = grupo_parts[1].title()
-                        else:
-                            categoria_actual = partes[2].title()
+            if any(codigo_norm.startswith(p) for p in ('SUBTOTAL', 'TOTAL', 'CODIGO')):
                 continue
 
             # Limpiar código (quitar .0 si pandas lo convirtió a float)
             try:
                 codigo_limpio = str(int(float(codigo_str)))
             except (ValueError, TypeError):
-                # Código alfanumérico (ej: "001", "9999") — mantener como está
-                codigo_limpio = codigo_str
+                codigo_limpio = codigo_str  # alfanumérico, mantener tal cual
 
-            # Ignorar código "9999" (artículo genérico de prueba)
             if codigo_limpio in ('9999', '0'):
                 continue
 
-            nombre = str(row.get('NOMBRE', codigo_limpio)).strip()
-            if nombre.lower() in ('nan', '', 'none'):
+            nombre = str(row[1]).strip() if pd.notna(row[1]) else codigo_limpio
+            if not nombre or nombre.lower() == 'nan':
                 nombre = codigo_limpio
 
-            uni = str(row.get('UNI', 'UNI')).strip()
-            if uni.lower() in ('nan', '', 'none'):
+            uni = str(row[2]).strip() if pd.notna(row[2]) else 'UNI'
+            if not uni or uni.lower() == 'nan':
                 uni = 'UNI'
 
-            # Conteo 1 y Conteo 2 — sumar ambos si existen
-            conteo1 = _safe_float(row.get('CONTEO 1', 0)) or 0
-            conteo2 = _safe_float(row.get('CONTEO 2', 0)) or 0
-            # Si solo hay conteo1, usar ese. Si hay ambos, usar conteo1 (el oficial)
-            stock_fila = conteo1 if conteo1 > 0 else conteo2
+            existencia_minima = _safe_float(row[3]) or 0
+            saldo = _safe_float(row[4]) or 0
 
-            # Consolidar: si el código ya existe, sumar el stock
             if codigo_limpio in consolidado:
-                consolidado[codigo_limpio]['stock'] += stock_fila
-                # Actualizar categoría si la actual es más específica
-                if categoria_actual and not consolidado[codigo_limpio]['categoria']:
-                    consolidado[codigo_limpio]['categoria'] = categoria_actual
+                consolidado[codigo_limpio]['saldo'] += saldo
+                consolidado[codigo_limpio]['existencia_minima'] = max(
+                    consolidado[codigo_limpio]['existencia_minima'], existencia_minima
+                )
             else:
                 consolidado[codigo_limpio] = {
-                    'nombre': nombre,
-                    'uni': uni,
-                    'stock': stock_fila,
-                    'categoria': categoria_actual,
+                    'nombre': nombre, 'uni': uni,
+                    'saldo': saldo, 'existencia_minima': existencia_minima,
                 }
 
-        # ── Paso 2: guardar en BD ──────────────────────────────────────────
         procesados, errores = 0, []
-
         for codigo, datos in consolidado.items():
             try:
-                art, created = Articulo.objects.get_or_create(
+                art, _ = Articulo.objects.get_or_create(
                     codigo=codigo,
                     defaults={
                         'descripcion': datos['nombre'],
                         'unidad_medida': datos['uni'],
-                        'stock_actual': datos['stock'],
-                        'categoria': datos['categoria'] or None,
+                        'stock_actual': datos['saldo'],
+                        'stock_minimo': datos['existencia_minima'],
                     },
                 )
-                # Actualizar siempre con los datos del nuevo archivo
-                art.stock_actual = datos['stock']
-                art.descripcion  = datos['nombre']
-                if datos['categoria']:
-                    art.categoria = datos['categoria']
-                art.save(update_fields=['stock_actual', 'descripcion', 'categoria', 'fecha_modificacion'])
+                art.stock_actual  = datos['saldo']
+                art.stock_minimo  = datos['existencia_minima']
+                art.descripcion   = datos['nombre']
+                art.save(update_fields=['stock_actual', 'stock_minimo', 'descripcion', 'fecha_modificacion'])
                 procesados += 1
             except Exception as e:
                 errores.append({'codigo': codigo, 'error': str(e)})
 
         return procesados, errores
 
-    def _procesar_ventas_cliente(self, df: pd.DataFrame, fecha_default):
-        """
-        Parsea el informe de Ventas por Cliente de Comercial Chemical.
+    # Conceptos del Kardex que representan una venta real a cliente (demanda).
+    # Se excluyen deliberadamente: "SALDO QUE VIENE" (saldo inicial, no es movimiento),
+    # "CREACION DE KITS DE PRODUCTOS" (ensamblaje interno, no demanda de cliente —
+    # infla la demanda tanto del kit como de sus componentes si se cuenta),
+    # compras a proveedor, traslados entre bodegas y uso propio.
+    CONCEPTOS_VENTA = {'FACTURACION PUNTO DE VENTA', 'FACTURA A CLIENTES', 'REMISION A CLIENTES'}
 
-        Estructura del Excel:
-          FECHA | DOC No | MARCA | CÓDIGO | NOMBRE | UNI | CANTIDAD | VALOR | %
-          (las filas de artículo tienen FECHA/DOC/MARCA vacíos)
-          Hay filas de encabezado de cliente (NIT + nombre) y filas SUBTOTAL.
-
-        Estrategia:
-          - Rastrear el cliente actual leyendo filas donde CODIGO es un NIT (texto largo).
-          - Procesar solo filas donde CODIGO sea numérico (código de artículo).
+    def _procesar_kardex(self, df: pd.DataFrame):
         """
+        Parsea el Informe Kardex de Comercial Chemical: un libro de movimientos
+        jerárquico (bodega → grupo → artículo → transacciones), donde cada
+        artículo trae una fila de encabezado (código + nombre) seguida de sus
+        filas de transacción (fecha, concepto, entradas, salidas, saldo, valor).
+
+        Estructura de columnas: FECHA | PR | DOC No | CONCEPTO | ENTRADAS |
+        SALIDAS | SALDO | VALOR | COSTO UNITARIO
+
+        Además de las ventas (VentaHistorico), guarda el SALDO de CADA
+        transacción —sin filtrar por concepto— en SaldoHistorico. Es la única
+        fuente que permite reconstruir cómo evolucionó el inventario real mes
+        a mes (VentaHistorico solo captura demanda, no existencias).
+        """
+        header_idx = _encontrar_fila_header(df, {'FECHA', 'CONCEPTO', 'SALDO'})
         procesados, errores = 0, []
-        articulos_creados = 0
+        codigo_actual, nombre_actual = None, None
+        articulos_cache: dict = {}
+        saldos_batch = []
 
-        cliente_actual_codigo = None
-        cliente_actual_nombre = None
-
-        for i, row in df.iterrows():
-            # Leer el valor de la columna CODIGO (ya normalizada)
-            raw_codigo = row.get('CODIGO', '')
-            codigo_str = str(raw_codigo).strip()
-
-            if not codigo_str or codigo_str.lower() in ('nan', '', 'none'):
-                continue
-
-            codigo_norm = _norm(codigo_str)
-
-            # ── Detectar fila de cliente (NIT o texto largo) ───────────────
-            # Las filas de cliente tienen el NIT en CODIGO y el nombre en NOMBRE
-            # Ej: "222.222.222.222" o "35.221.260"
-            if re.match(r'^[\d\.\s]+$', codigo_str) and len(codigo_str) > 6:
-                # Podría ser NIT — verificar que no sea código de artículo (≤4 dígitos)
-                solo_digitos = re.sub(r'[\.\s]', '', codigo_str)
-                if len(solo_digitos) > 6:
-                    # Es un NIT de cliente
-                    cliente_actual_codigo = codigo_str
-                    nombre_raw = row.get('NOMBRE', '')
-                    cliente_actual_nombre = str(nombre_raw).strip() if pd.notna(nombre_raw) else None
-                    if cliente_actual_nombre and cliente_actual_nombre.lower() in ('nan', '', 'none'):
-                        cliente_actual_nombre = None
-                    continue
-
-            # ── Ignorar filas de subtotal / total / servicios ──────────────
-            if any(codigo_norm.startswith(p) for p in
-                   ('SUBTOTAL', 'TOTAL', 'SERVICIOS', 'EN.', 'FECHA', 'DOC')):
-                continue
-
-            # ── Solo procesar si el código es numérico (artículo) ──────────
-            try:
-                # Limpiar código: quitar decimales si es entero (1011.0 → 1011)
-                codigo_limpio = str(int(float(codigo_str)))
-            except (ValueError, TypeError):
-                continue
-
-            try:
-                descripcion = str(row.get('NOMBRE', codigo_str)).strip()
-                if descripcion.lower() in ('nan', '', 'none'):
-                    descripcion = codigo_str
-
-                uni = str(row.get('UNI', 'UNI')).strip()
-                if uni.lower() in ('nan', '', 'none'):
-                    uni = 'UNI'
-
-                # Fecha: columna FECHA o la del encabezado del reporte
-                fecha_raw = row.get('FECHA', None)
-                if fecha_raw is not None and not (isinstance(fecha_raw, float) and pd.isna(fecha_raw)):
-                    try:
-                        fecha = pd.to_datetime(fecha_raw, dayfirst=True).date()
-                    except Exception:
-                        fecha = fecha_default
-                else:
-                    fecha = fecha_default or date.today()
-
-                cantidad = _safe_float(row.get('CANTIDAD', row.get('CANT', 0))) or 0
-                if cantidad <= 0:
-                    continue
-
-                valor = _safe_float(row.get('VALOR', row.get('VALOR TOTAL', None)))
-
-                # Crear o recuperar artículo usando código limpio
-                art, created = Articulo.objects.get_or_create(
-                    codigo=codigo_limpio,
-                    defaults={'descripcion': descripcion, 'unidad_medida': uni},
+        def _get_articulo(codigo, nombre):
+            if codigo not in articulos_cache:
+                art, _ = Articulo.objects.get_or_create(
+                    codigo=codigo,
+                    defaults={'descripcion': nombre or codigo, 'unidad_medida': 'UNI'},
                 )
-                if created:
-                    articulos_creados += 1
+                articulos_cache[codigo] = art
+            return articulos_cache[codigo]
 
+        for i in range(header_idx + 1, len(df)):
+            row = df.iloc[i]
+            col0, col1, col2, col3 = row[0], row[1], row[2], row[3]
+            col0_str = str(col0).strip() if pd.notna(col0) else ''
+            col0_norm = _norm(col0_str)
+
+            # ── Fila de encabezado de artículo: col0 vacío, código y nombre en col1/col2 ──
+            if not col0_str and pd.notna(col1) and pd.notna(col2):
+                codigo_raw = str(col1).strip()
+                try:
+                    codigo_actual = str(int(float(codigo_raw)))
+                except (ValueError, TypeError):
+                    codigo_actual = codigo_raw
+                nombre_raw = str(col2).strip()
+                nombre_actual = re.sub(r'\s+UNI$', '', nombre_raw, flags=re.IGNORECASE).strip() or nombre_raw
+                continue
+
+            # ── Filas estructurales: subtotales, encabezados de bodega/grupo ──
+            if any(col0_norm.startswith(p) for p in
+                   ('SUBTOTAL', 'TOTAL', 'BODEGA', 'GRUPO', 'INVENTARIOS')):
+                continue
+
+            # ── Fila de transacción: requiere artículo en contexto y fecha ──
+            if not codigo_actual or not col0_str:
+                continue
+
+            fecha = _parse_fecha(col0)
+            if not fecha:
+                continue
+
+            # Saldo de ESTA transacción, sea cual sea su concepto — alimenta
+            # el histórico de existencias reales (no solo de ventas).
+            saldo_val = _safe_float(row[6])
+            if saldo_val is not None:
+                saldos_batch.append((codigo_actual, nombre_actual, fecha, saldo_val))
+
+            concepto = str(col3).strip() if pd.notna(col3) else ''
+            if _norm(concepto) not in self.CONCEPTOS_VENTA:
+                continue
+
+            salidas = _safe_float(row[5]) or 0
+            if salidas <= 0:
+                continue
+
+            valor = _safe_float(row[7])
+            valor_abs = abs(valor) if valor is not None else None
+
+            try:
+                art = _get_articulo(codigo_actual, nombre_actual)
                 VentaHistorico.objects.create(
                     fecha=fecha,
-                    codigo_cliente=cliente_actual_codigo,
-                    nombre_cliente=cliente_actual_nombre,
                     articulo=art,
-                    cantidad_vendida=cantidad,
-                    valor_total=valor,
+                    cantidad_vendida=salidas,
+                    valor_total=valor_abs,
                     importacion=None,
                 )
                 procesados += 1
-
             except Exception as e:
-                errores.append({'fila': i + 1, 'codigo': codigo_str, 'error': str(e)})
+                errores.append({'fila': i + 1, 'codigo': codigo_actual, 'error': str(e)})
 
-        return procesados, errores, articulos_creados
+        saldo_objs = [
+            SaldoHistorico(articulo=_get_articulo(codigo, nombre), fecha=fecha, saldo=saldo_val, importacion=None)
+            for codigo, nombre, fecha, saldo_val in saldos_batch
+        ]
+        SaldoHistorico.objects.bulk_create(saldo_objs, batch_size=2000)
+
+        return procesados, errores
 
 
 # ── Vistas auxiliares ──────────────────────────────────────────────────────────

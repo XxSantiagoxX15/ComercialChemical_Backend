@@ -2,6 +2,8 @@
 Microservicio Inventario — portado a Django REST Framework.
 Fuente: Chem Movid backend/inventario/main.py
 """
+from datetime import timedelta
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -9,13 +11,14 @@ from rest_framework.exceptions import ValidationError
 
 from apps.auth.permissions import IsAdmin, IsAdminOrInventario, IsAuthenticated
 from apps.auditoria.services import registrar_evento
-from .models import Articulo, Kit
+from apps.common import get_pagination_params
+from .models import Articulo, Kit, LoteInventario
 from .serializers import (
     ArticuloSerializer, MovimientoInventarioSerializer,
     RegistrarMovimientoSerializer, KitSerializer,
-    ProducirKitSerializer, AlertaStockSerializer
+    ProducirKitSerializer, AlertaStockSerializer, LoteInventarioSerializer
 )
-from .services import ArticuloService, MovimientoService, KitService
+from .services import ArticuloService, MovimientoService, KitService, resumen_stock_mensual
 
 
 def _get_ip(request):
@@ -37,9 +40,11 @@ class ArticuloListView(APIView):
     def get(self, request):
         buscar = request.query_params.get('buscar')
         categoria = request.query_params.get('categoria')
-        page = int(request.query_params.get('page', 1))
-        limit = min(int(request.query_params.get('limit', 50)), 500)
-        articulos, total = ArticuloService.listar(buscar=buscar, categoria=categoria, page=page, limit=limit)
+        tipo_producto = request.query_params.get('tipo_producto')
+        page, limit = get_pagination_params(request, default_limit=50, max_limit=500)
+        articulos, total = ArticuloService.listar(
+            buscar=buscar, categoria=categoria, tipo_producto=tipo_producto, page=page, limit=limit
+        )
         return Response({'articulos': ArticuloSerializer(articulos, many=True).data,
                          'total': total, 'page': page, 'limit': limit})
 
@@ -78,8 +83,7 @@ class MovimientoListView(APIView):
         tipo = request.query_params.get('tipo_movimiento')
         fecha_desde = request.query_params.get('fecha_desde')
         fecha_hasta = request.query_params.get('fecha_hasta')
-        page = int(request.query_params.get('page', 1))
-        limit = min(int(request.query_params.get('limit', 50)), 500)
+        page, limit = get_pagination_params(request, default_limit=50, max_limit=500)
         movimientos, total = MovimientoService.listar(
             articulo_id=articulo_id, tipo=tipo,
             fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
@@ -97,9 +101,11 @@ class MovimientoListView(APIView):
             articulo_id=d['articulo_id'],
             tipo=d['tipo_movimiento'],
             cantidad=float(d['cantidad']),
-            usuario=None,
+            usuario_id=_get_usuario_id(request),
             observaciones=d.get('observaciones'),
             forzar=d.get('forzar', False),
+            numero_lote=d.get('numero_lote') or None,
+            fecha_vencimiento=d.get('fecha_vencimiento'),
         )
         registrar_evento('MOVIMIENTO_INVENTARIO',
                          f"Movimiento {d['tipo_movimiento']} de {d['cantidad']} en artículo {d['articulo_id']}",
@@ -114,8 +120,42 @@ class AlertasStockCriticoView(APIView):
     permission_classes = [IsAdminOrInventario]
 
     def get(self, request):
-        alertas = ArticuloService.alertas_stock_critico()
+        incluir_ignoradas = request.query_params.get('incluir_ignoradas') == 'true'
+        alertas = ArticuloService.alertas_stock_critico(incluir_ignoradas=incluir_ignoradas)
         data = AlertaStockSerializer(alertas, many=True).data
+        return Response({'alertas': data, 'total': len(data)})
+
+
+# ─── Lotes y vencimientos ──────────────────────────────────────────────────────
+
+class LotesArticuloView(APIView):
+    permission_classes = [IsAdminOrInventario]
+
+    def get(self, request, articulo_id):
+        lotes = (
+            LoteInventario.objects
+            .filter(articulo_id=articulo_id, activo=True)
+            .select_related('articulo')
+        )
+        return Response(LoteInventarioSerializer(lotes, many=True).data)
+
+
+class AlertasVencimientoView(APIView):
+    permission_classes = [IsAdminOrInventario]
+
+    def get(self, request):
+        try:
+            dias = int(request.query_params.get('dias', 30))
+        except (TypeError, ValueError):
+            raise ValidationError('El parámetro dias debe ser un número entero.')
+        limite = timezone.now().date() + timedelta(days=dias)
+        lotes = (
+            LoteInventario.objects
+            .filter(activo=True, cantidad_disponible__gt=0,
+                    fecha_vencimiento__isnull=False, fecha_vencimiento__lte=limite)
+            .select_related('articulo')
+        )
+        data = LoteInventarioSerializer(lotes, many=True).data
         return Response({'alertas': data, 'total': len(data)})
 
 
@@ -140,6 +180,26 @@ class KitListView(APIView):
         return Response(KitSerializer(kit).data, status=201)
 
 
+class KitsProduciblesView(APIView):
+    """Módulo de producción: cuántas unidades de cada kit se pueden armar
+    con el stock actual de sus componentes."""
+    permission_classes = [IsAdminOrInventario]
+
+    def get(self, request):
+        data = KitService.producibles()
+        return Response({'kits': data, 'total': len(data)})
+
+
+class ResumenStockMensualView(APIView):
+    """Evolución real del inventario total mes a mes (reconstruida del Kardex)
+    vs. el mínimo total configurado hoy — para el widget del Dashboard."""
+    permission_classes = [IsAdminOrInventario]
+
+    def get(self, request):
+        meses = int(request.query_params.get('meses', 12))
+        return Response(resumen_stock_mensual(meses_historico=meses))
+
+
 class KitProducirView(APIView):
     permission_classes = [IsAdmin]
 
@@ -150,7 +210,7 @@ class KitProducirView(APIView):
         resultado = KitService.producir(
             kit_id=pk,
             cantidad=serializer.validated_data['cantidad'],
-            usuario=None,
+            usuario_id=_get_usuario_id(request),
             forzar=serializer.validated_data.get('forzar', False),
         )
         registrar_evento('PRODUCIR_KIT', f"Kit {pk} producido x{serializer.validated_data['cantidad']}",

@@ -4,8 +4,8 @@ from apps.inventario.models import Articulo
 
 class Importacion(models.Model):
     TIPO_CHOICES = [
-        ('Informe_Toma_Inventario', 'Informe Toma Inventario'),
-        ('Informe_Ventas_Cliente', 'Informe Ventas Cliente'),
+        ('Informe_Saldos_Existencias_Minimas', 'Informe Saldos vs Existencias Mínimas'),
+        ('Informe_Kardex', 'Informe Kardex'),
     ]
     RESULTADO_CHOICES = [
         ('exito', 'Éxito'),
@@ -41,4 +41,23 @@ class VentaHistorico(models.Model):
         ordering = ['-fecha']
         indexes = [
             models.Index(fields=['articulo', '-fecha']),
+        ]
+
+
+class SaldoHistorico(models.Model):
+    """Saldo (existencia) de un artículo justo después de CADA transacción del
+    Kardex, sin filtrar por tipo de concepto (a diferencia de VentaHistorico,
+    que solo guarda ventas). Permite reconstruir cómo evolucionó el inventario
+    total real mes a mes, algo que no se puede derivar de ningún otro dato."""
+    fecha = models.DateField()
+    articulo = models.ForeignKey(Articulo, on_delete=models.CASCADE, related_name='saldos_historicos')
+    saldo = models.DecimalField(max_digits=15, decimal_places=3)
+    importacion = models.ForeignKey(Importacion, on_delete=models.SET_NULL, null=True, blank=True)
+
+    class Meta:
+        db_table = 'saldo_historico'
+        ordering = ['fecha']
+        indexes = [
+            models.Index(fields=['articulo', 'fecha']),
+            models.Index(fields=['fecha']),
         ]

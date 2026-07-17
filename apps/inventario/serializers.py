@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.db.models import Sum
-from .models import Articulo, MovimientoInventario, Kit, KitComponente
+from .models import Articulo, MovimientoInventario, Kit, KitComponente, LoteInventario
 
 
 class ArticuloSerializer(serializers.ModelSerializer):
@@ -11,20 +11,28 @@ class ArticuloSerializer(serializers.ModelSerializer):
     class Meta:
         model = Articulo
         fields = [
-            'id', 'codigo', 'descripcion', 'categoria', 'unidad_medida',
+            'id', 'codigo', 'descripcion', 'categoria', 'unidad_medida', 'tipo_producto',
             'stock_actual', 'stock_minimo', 'stock_maximo',
             'tiempo_reposicion_dias', 'activo',
+            'ficha_seguridad', 'clasificacion_peligro',
+            'costo_pedido', 'costo_mantenimiento_anual',
+            'alerta_ignorada', 'fecha_alerta_ignorada',
             'en_stock_critico', 'total_vendido', 'valor_vendido',
             'fecha_creacion', 'fecha_modificacion'
         ]
-        read_only_fields = ['id', 'stock_actual', 'fecha_creacion', 'fecha_modificacion']
+        read_only_fields = ['id', 'stock_actual', 'fecha_alerta_ignorada', 'fecha_creacion', 'fecha_modificacion']
 
     def get_total_vendido(self, obj):
+        # Si el queryset viene anotado (listar/obtener), evita una query extra por artículo.
+        if hasattr(obj, 'total_vendido_calc'):
+            return float(obj.total_vendido_calc)
         result = obj.ventas.aggregate(total=Sum('cantidad_vendida'))
         total = result.get('total')
         return float(total) if total is not None else 0.0
 
     def get_valor_vendido(self, obj):
+        if hasattr(obj, 'valor_vendido_calc'):
+            return float(obj.valor_vendido_calc)
         result = obj.ventas.aggregate(total=Sum('valor_total'))
         total = result.get('total')
         return float(total) if total is not None else 0.0
@@ -53,6 +61,28 @@ class RegistrarMovimientoSerializer(serializers.Serializer):
     cantidad = serializers.DecimalField(max_digits=15, decimal_places=3, min_value=0.001)
     observaciones = serializers.CharField(required=False, allow_blank=True)
     forzar = serializers.BooleanField(default=False)
+    numero_lote = serializers.CharField(required=False, allow_blank=True)
+    fecha_vencimiento = serializers.DateField(required=False, allow_null=True)
+
+
+class LoteInventarioSerializer(serializers.ModelSerializer):
+    articulo_codigo = serializers.CharField(source='articulo.codigo', read_only=True)
+    articulo_descripcion = serializers.CharField(source='articulo.descripcion', read_only=True)
+    dias_para_vencer = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LoteInventario
+        fields = [
+            'id', 'articulo', 'articulo_codigo', 'articulo_descripcion',
+            'numero_lote', 'cantidad_inicial', 'cantidad_disponible',
+            'fecha_vencimiento', 'fecha_ingreso', 'activo', 'dias_para_vencer',
+        ]
+
+    def get_dias_para_vencer(self, obj):
+        if not obj.fecha_vencimiento:
+            return None
+        from django.utils import timezone
+        return (obj.fecha_vencimiento - timezone.now().date()).days
 
 
 class KitComponenteSerializer(serializers.ModelSerializer):
@@ -91,6 +121,8 @@ class AlertaStockSerializer(serializers.Serializer):
     stock_minimo = serializers.DecimalField(max_digits=15, decimal_places=3)
     porcentaje_stock = serializers.FloatField()
     nivel_urgencia = serializers.SerializerMethodField()
+    alerta_ignorada = serializers.BooleanField()
+    fecha_alerta_ignorada = serializers.DateTimeField(allow_null=True)
 
     def get_nivel_urgencia(self, obj):
         return 'critico' if float(obj.porcentaje_stock) <= 50 else 'bajo'

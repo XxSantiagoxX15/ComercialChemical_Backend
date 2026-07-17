@@ -4,15 +4,21 @@ Equivalente al WebSocket /inventario/ws/alertas del microservicio Chem Movid.
 """
 import asyncio
 import json
+from urllib.parse import parse_qs
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.db.models import F, ExpressionWrapper, FloatField
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.exceptions import TokenError, InvalidToken
 from .models import Articulo
 
 
 class AlertasStockConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
+        if not await self._autenticar():
+            await self.close(code=4401)
+            return
         await self.channel_layer.group_add('alertas_stock', self.channel_name)
         await self.accept()
         # Enviar alertas iniciales al conectar
@@ -42,6 +48,20 @@ class AlertasStockConsumer(AsyncWebsocketConsumer):
                 await self.send(text_data=json.dumps({'tipo': 'alertas_stock', 'data': alertas}))
             except Exception:
                 break
+
+    @database_sync_to_async
+    def _autenticar(self):
+        """El navegador no puede enviar headers en el handshake WS,
+        así que el JWT se recibe como query param: ws/...?token=<jwt>."""
+        query_string = self.scope.get('query_string', b'').decode()
+        token = parse_qs(query_string).get('token', [None])[0]
+        if not token:
+            return False
+        try:
+            AccessToken(token)
+            return True
+        except (TokenError, InvalidToken):
+            return False
 
     @database_sync_to_async
     def _get_alertas(self):

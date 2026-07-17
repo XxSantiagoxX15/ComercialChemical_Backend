@@ -1,10 +1,25 @@
+import uuid
 from rest_framework import serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema
 from apps.auth.permissions import IsAdminOrInventario, IsAdminOrCompras
+from apps.auditoria.services import registrar_evento
 from .models import Prediccion
-from .services import calcular_prediccion, analisis_estadistico, generar_recomendaciones_compras
+from .services import (
+    calcular_prediccion, analisis_estadistico, generar_recomendaciones_compras, calcular_eoq,
+    resumen_historico_pronostico,
+)
+
+
+def _get_ip(request):
+    fwd = request.META.get('HTTP_X_FORWARDED_FOR')
+    return fwd.split(',')[0].strip() if fwd else request.META.get('REMOTE_ADDR', 'unknown')
+
+
+def _get_usuario_id(request):
+    token = getattr(request, 'auth', None)
+    return token.get('usuario_id') if token else None
 
 
 class PrediccionSerializer(serializers.ModelSerializer):
@@ -44,6 +59,16 @@ class AnalisisEstadisticoView(APIView):
         return Response(analisis_estadistico(articulo_id))
 
 
+class ResumenHistoricoPronosticoView(APIView):
+    """Línea de tiempo global (todos los artículos) para el widget del Dashboard:
+    demanda histórica mensual vs. demanda proyectada mensual."""
+    permission_classes = [IsAdminOrInventario]
+
+    def get(self, request):
+        meses = int(request.query_params.get('meses', 12))
+        return Response(resumen_historico_pronostico(meses_historico=meses))
+
+
 class ProductosMasVendidosView(APIView):
     permission_classes = [IsAdminOrInventario]
 
@@ -66,3 +91,49 @@ class RecomendacionesView(APIView):
     def get(self, request):
         data = generar_recomendaciones_compras()
         return Response({'recomendaciones': data, 'total': len(data)})
+
+
+class EOQView(APIView):
+    """Cantidad económica de pedido para un artículo."""
+    permission_classes = [IsAdminOrCompras]
+
+    def get(self, request, articulo_id):
+        resultado = calcular_eoq(articulo_id)
+        if 'error' in resultado:
+            return Response(resultado, status=400)
+        return Response(resultado)
+
+
+class GenerarOrdenCompraView(APIView):
+    """Cierra el ciclo pronóstico → compra: crea una OrdenCompra en estado
+    'pendiente' a partir de la recomendación de pronóstico vigente para un artículo."""
+    permission_classes = [IsAdminOrCompras]
+
+    def post(self, request, articulo_id):
+        from apps.compras.models import OrdenCompra
+        from apps.compras.views import OrdenCompraSerializer
+
+        recomendaciones = generar_recomendaciones_compras()
+        rec = next((r for r in recomendaciones if r['articulo_id'] == articulo_id), None)
+        if not rec:
+            return Response({'error': 'No hay recomendación disponible para este artículo.'}, status=404)
+        if rec['cantidad_recomendada'] <= 0:
+            return Response({'error': 'La cantidad recomendada es 0; no se requiere generar una orden.'}, status=400)
+
+        usuario_id = _get_usuario_id(request)
+        orden = OrdenCompra.objects.create(
+            numero_orden=f"OC-{uuid.uuid4().hex[:8].upper()}",
+            articulo_id=articulo_id,
+            cantidad_solicitada=rec['cantidad_recomendada'],
+            estado='pendiente',
+            usuario_id=usuario_id,
+            observaciones=(
+                f"Generada automáticamente desde recomendación de pronóstico "
+                f"(prioridad: {rec['nivel_prioridad']}, demanda proyectada: {rec['demanda_proyectada']})."
+            ),
+        )
+        registrar_evento(
+            'CREAR_ORDEN_COMPRA', f'Orden {orden.numero_orden} generada desde recomendación de pronóstico',
+            usuario_id=usuario_id, entidad='orden_compra', entidad_id=orden.id, ip=_get_ip(request),
+        )
+        return Response(OrdenCompraSerializer(orden).data, status=201)

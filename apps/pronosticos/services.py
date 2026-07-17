@@ -2,6 +2,7 @@
 Motor de forecasting portado del Chem Movid.
 Fuente: backend/forecasting/engine/ (arima.py, exponential_smoothing.py, linear_regression.py)
 """
+import math
 import numpy as np
 import pandas as pd
 from apps.ventas.models import VentaHistorico
@@ -147,11 +148,23 @@ def analisis_estadistico(articulo_id: int) -> dict:
 
 
 def generar_recomendaciones_compras() -> list:
-    """Portado de Chem Movid compras service: recomendaciones basadas en forecasting."""
-    articulos = Articulo.objects.filter(activo=True)
+    """Portado de Chem Movid compras service: recomendaciones basadas en forecasting.
+    Excluye artículos cuya alerta el usuario marcó como "No me interesa"."""
+    articulos = list(Articulo.objects.filter(activo=True, alerta_ignorada=False))
+
+    # Una sola query para todas las predicciones en vez de una por artículo (N+1).
+    predicciones = (
+        Prediccion.objects
+        .filter(articulo_id__in=[a.id for a in articulos])
+        .order_by('articulo_id', '-fecha_prediccion')
+    )
+    ultima_prediccion_por_articulo = {}
+    for pred in predicciones:
+        ultima_prediccion_por_articulo.setdefault(pred.articulo_id, pred)
+
     recomendaciones = []
     for art in articulos:
-        pred = Prediccion.objects.filter(articulo=art).order_by('-fecha_prediccion').first()
+        pred = ultima_prediccion_por_articulo.get(art.id)
         demanda = float(pred.demanda_proyectada) if pred else 0
         stock = float(art.stock_actual)
         stock_min = float(art.stock_minimo)
@@ -175,3 +188,84 @@ def generar_recomendaciones_compras() -> list:
         })
     orden = {'critico': 0, 'alto': 1, 'medio': 2, 'bajo': 3}
     return sorted(recomendaciones, key=lambda x: orden.get(x['nivel_prioridad'], 4))
+
+
+def calcular_eoq(articulo_id: int) -> dict:
+    """
+    Cantidad económica de pedido (EOQ = sqrt(2*D*S/H)):
+    - D: demanda anual estimada (última predicción mensual x 12)
+    - S: costo_pedido del artículo
+    - H: costo_mantenimiento_anual del artículo
+    Requiere que el artículo tenga costos configurados y al menos una predicción calculada.
+    """
+    try:
+        articulo = Articulo.objects.get(id=articulo_id)
+    except Articulo.DoesNotExist:
+        return {'error': 'Artículo no encontrado'}
+
+    if not articulo.costo_pedido or not articulo.costo_mantenimiento_anual:
+        return {
+            'error': 'Este artículo no tiene costo de pedido y/o costo de mantenimiento configurados.',
+            'articulo_id': articulo_id,
+        }
+
+    pred = Prediccion.objects.filter(articulo_id=articulo_id).order_by('-fecha_prediccion').first()
+    if not pred:
+        return {'error': 'Este artículo no tiene un pronóstico calculado todavía.'}
+
+    demanda_anual = float(pred.demanda_proyectada) * 12
+    costo_pedido = float(articulo.costo_pedido)
+    costo_mantenimiento = float(articulo.costo_mantenimiento_anual)
+
+    if demanda_anual <= 0 or costo_mantenimiento <= 0:
+        return {'error': 'No se puede calcular EOQ: demanda proyectada o costo de mantenimiento inválidos.'}
+
+    eoq = math.sqrt((2 * demanda_anual * costo_pedido) / costo_mantenimiento)
+    num_pedidos_anual = demanda_anual / eoq if eoq > 0 else 0
+
+    return {
+        'articulo_id': articulo_id,
+        'demanda_anual_estimada': round(demanda_anual, 3),
+        'costo_pedido': costo_pedido,
+        'costo_mantenimiento_anual': costo_mantenimiento,
+        'cantidad_economica_pedido': round(eoq, 3),
+        'numero_pedidos_por_anio': round(num_pedidos_anual, 2) if num_pedidos_anual else None,
+        'dias_entre_pedidos': round(365 / num_pedidos_anual, 1) if num_pedidos_anual > 0 else None,
+    }
+
+
+def resumen_historico_pronostico(meses_historico: int = 12) -> dict:
+    """
+    Línea de tiempo global para el Dashboard: demanda histórica total (suma de
+    todos los artículos, por mes) seguida de la demanda proyectada total
+    (suma de las predicciones ya calculadas, modelo suavización exponencial,
+    que es el que usa por defecto la pantalla de Pronósticos).
+    """
+    from django.db.models import Sum
+    from django.db.models.functions import TruncMonth
+    from apps.ventas.models import VentaHistorico
+
+    historico_qs = (
+        VentaHistorico.objects
+        .annotate(mes=TruncMonth('fecha'))
+        .values('mes')
+        .annotate(total=Sum('cantidad_vendida'))
+        .order_by('mes')
+    )
+    historico = list(historico_qs)[-meses_historico:]
+
+    pronostico_qs = (
+        Prediccion.objects
+        .filter(modelo='suavizacion_exponencial')
+        .annotate(mes=TruncMonth('fecha_prediccion'))
+        .values('mes')
+        .annotate(total=Sum('demanda_proyectada'))
+        .order_by('mes')
+    )
+    pronostico = list(pronostico_qs)
+
+    return {
+        'historico':  [{'mes': h['mes'].strftime('%Y-%m'), 'total': round(float(h['total']), 3)} for h in historico],
+        'pronostico': [{'mes': p['mes'].strftime('%Y-%m'), 'total': round(float(p['total']), 3)} for p in pronostico],
+        'tiene_pronostico': len(pronostico) > 0,
+    }

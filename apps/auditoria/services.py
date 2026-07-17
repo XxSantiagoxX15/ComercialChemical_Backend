@@ -1,5 +1,8 @@
 """Servicio de auditoría — equivalente al audit_client.py de Chem Movid."""
+import logging
 from .models import EventoAuditoria
+
+logger = logging.getLogger(__name__)
 
 
 def registrar_evento(
@@ -28,5 +31,9 @@ def registrar_evento(
             ip_cliente=ip,
         )
     except Exception:
-        # Nunca fallar por auditoría — log silencioso
+        # Nunca fallar por auditoría, pero sí dejar rastro del fallo
+        logger.exception(
+            'Fallo al registrar evento de auditoría: tipo_accion=%s usuario_id=%s entidad=%s entidad_id=%s',
+            tipo_accion, usuario_id, entidad, entidad_id,
+        )
         return None
