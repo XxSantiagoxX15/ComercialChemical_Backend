@@ -83,11 +83,12 @@ class MovimientoListView(APIView):
         tipo = request.query_params.get('tipo_movimiento')
         fecha_desde = request.query_params.get('fecha_desde')
         fecha_hasta = request.query_params.get('fecha_hasta')
+        ordering = request.query_params.get('ordering', '-fecha_movimiento')
         page, limit = get_pagination_params(request, default_limit=50, max_limit=500)
         movimientos, total = MovimientoService.listar(
             articulo_id=articulo_id, tipo=tipo,
             fecha_desde=fecha_desde, fecha_hasta=fecha_hasta,
-            page=page, limit=limit
+            page=page, limit=limit, ordering=ordering,
         )
         return Response({'movimientos': MovimientoInventarioSerializer(movimientos, many=True).data,
                          'total': total, 'page': page, 'limit': limit})

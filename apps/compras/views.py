@@ -4,12 +4,14 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from django.db.models import Sum, Avg, Min, Max, Count, Q
+from django.http import HttpResponse
 from drf_spectacular.utils import extend_schema
 from apps.auth.permissions import IsAdminOrCompras
 from apps.auditoria.services import registrar_evento
 from apps.inventario.services import MovimientoService
 from apps.inventario.models import Articulo
 from .models import OrdenCompra, Proveedor, ProveedorArticulo
+from .pdf import generar_pdf_orden
 
 
 class OrdenCompraSerializer(serializers.ModelSerializer):
@@ -126,6 +128,21 @@ class OrdenCompraDetailView(APIView):
                                  entidad_id=pk, ip=_get_ip(request))
 
         return Response(OrdenCompraSerializer(orden).data)
+
+
+class OrdenCompraPdfView(APIView):
+    permission_classes = [IsAdminOrCompras]
+
+    def get(self, request, pk):
+        try:
+            orden = OrdenCompra.objects.select_related('articulo', 'usuario').get(id=pk)
+        except OrdenCompra.DoesNotExist:
+            return Response({'error': 'Orden no encontrada'}, status=404)
+
+        pdf_bytes = generar_pdf_orden(orden)
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="{orden.numero_orden}.pdf"'
+        return response
 
 
 # ── Proveedores ────────────────────────────────────────────────────────────────

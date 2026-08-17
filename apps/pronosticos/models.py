@@ -7,6 +7,7 @@ class Prediccion(models.Model):
         ('suavizacion_exponencial', 'Suavización Exponencial'),
         ('arima', 'ARIMA'),
         ('regresion_minimos_cuadrados', 'Regresión Mínimos Cuadrados'),
+        ('auto', 'Automático (el más preciso por backtesting)'),
     ]
     articulo = models.ForeignKey(Articulo, on_delete=models.CASCADE, related_name='predicciones')
     modelo = models.CharField(max_length=50, choices=MODELO_CHOICES)

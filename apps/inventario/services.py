@@ -5,7 +5,7 @@ Usa select_for_update() para evitar race conditions (equivalente al FOR UPDATE d
 import uuid
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import F, ExpressionWrapper, FloatField, Sum, Value, DecimalField
+from django.db.models import F, Q, ExpressionWrapper, FloatField, Sum, Value, DecimalField
 from django.db.models.functions import Coalesce
 from rest_framework.exceptions import ValidationError
 from .models import Articulo, MovimientoInventario, Kit, KitComponente, LoteInventario
@@ -75,13 +75,23 @@ class ArticuloService:
     @staticmethod
     def alertas_stock_critico(incluir_ignoradas: bool = False):
         """Req 6.1-6.5 Chem Movid: artículos con stock <= stock_minimo, ordenados por urgencia.
-        Por defecto excluye los que el usuario marcó como "No me interesa"."""
-        qs = Articulo.objects.filter(activo=True, stock_minimo__gt=0)
+        Por defecto excluye los que el usuario marcó como "No me interesa".
+
+        La gran mayoría del catálogo (2277 de 2280 artículos) no trae un Stock
+        Mínimo configurado en el archivo de Existencias Mínimas (queda en 0), así
+        que exigir stock_minimo > 0 dejaba fuera a casi todo el catálogo, incluidos
+        artículos en 0 o en stock negativo. Por eso también se alerta, sin importar
+        el mínimo, a cualquier artículo cuyo stock actual sea <= 0.
+        """
+        qs = Articulo.objects.filter(activo=True)
         if not incluir_ignoradas:
             qs = qs.filter(alerta_ignorada=False)
+        qs = qs.filter(
+            Q(stock_minimo__gt=0, stock_actual__lte=F('stock_minimo')) |
+            Q(stock_actual__lte=0)
+        )
         return (
-            qs.filter(stock_actual__lte=F('stock_minimo'))
-            .annotate(
+            qs.annotate(
                 porcentaje_stock=ExpressionWrapper(
                     F('stock_actual') * 100.0 / (F('stock_minimo') + 0.001),
                     output_field=FloatField()
@@ -188,8 +198,19 @@ class MovimientoService:
             lote.save(update_fields=['cantidad_disponible', 'activo'])
             restante -= usar
 
+    # Mapea el nombre de columna que manda el frontend al campo/lookup real de Django.
+    ORDERING_FIELDS = {
+        'fecha_movimiento': 'fecha_movimiento',
+        'articulo': 'articulo__codigo',
+        'tipo_movimiento': 'tipo_movimiento',
+        'cantidad': 'cantidad',
+        'usuario': 'usuario__nombre_completo',
+        'observaciones': 'observaciones',
+    }
+
     @staticmethod
-    def listar(articulo_id=None, tipo=None, fecha_desde=None, fecha_hasta=None, page=1, limit=50):
+    def listar(articulo_id=None, tipo=None, fecha_desde=None, fecha_hasta=None,
+               page=1, limit=50, ordering='-fecha_movimiento'):
         qs = MovimientoInventario.objects.select_related('articulo', 'usuario')
         if articulo_id:
             qs = qs.filter(articulo_id=articulo_id)
@@ -199,6 +220,10 @@ class MovimientoService:
             qs = qs.filter(fecha_movimiento__gte=fecha_desde)
         if fecha_hasta:
             qs = qs.filter(fecha_movimiento__lte=fecha_hasta)
+        desc = (ordering or '').startswith('-')
+        campo = (ordering or '').lstrip('-')
+        campo_real = MovimientoService.ORDERING_FIELDS.get(campo, 'fecha_movimiento')
+        qs = qs.order_by(('-' if desc else '') + campo_real, 'id')
         total = qs.count()
         offset = (page - 1) * limit
         return qs[offset:offset + limit], total

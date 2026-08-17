@@ -2,6 +2,7 @@ from rest_framework import serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from apps.auth.permissions import IsAdmin
+from apps.auth.models import Usuario
 from apps.common import get_pagination_params
 from .models import EventoAuditoria
 
@@ -28,8 +29,19 @@ class AuditoriaListView(APIView):
 
         total = qs.count()
         offset = (page - 1) * limit
-        eventos = qs[offset:offset + limit]
+        eventos = list(qs[offset:offset + limit])
+
+        # usuario_id no es FK (el log de auditoría es intencionalmente
+        # independiente de la tabla de usuarios), así que el nombre se
+        # resuelve aparte con una sola query en vez de una por evento.
+        usuario_ids = {e.usuario_id for e in eventos if e.usuario_id}
+        nombres = dict(Usuario.objects.filter(id__in=usuario_ids).values_list('id', 'nombre_completo'))
+
+        data = EventoAuditoriaSerializer(eventos, many=True).data
+        for item in data:
+            item['usuario_nombre'] = nombres.get(item['usuario_id'])
+
         return Response({
-            'eventos': EventoAuditoriaSerializer(eventos, many=True).data,
+            'eventos': data,
             'total': total, 'page': page, 'limit': limit
         })

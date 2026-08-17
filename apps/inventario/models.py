@@ -3,6 +3,7 @@ App: inventario — Artículos, movimientos, kits y alertas de stock.
 Lógica portada del microservicio inventario/main.py de Chem Movid.
 """
 from django.db import models
+from django.utils import timezone
 from apps.auth.models import Usuario
 
 
@@ -91,7 +92,19 @@ class MovimientoInventario(models.Model):
     stock_resultante = models.DecimalField(max_digits=15, decimal_places=3)
     usuario = models.ForeignKey(Usuario, on_delete=models.SET_NULL, null=True, blank=True)
     observaciones = models.TextField(null=True, blank=True)
-    fecha_movimiento = models.DateTimeField(auto_now_add=True)
+    # default=timezone.now (no auto_now_add) para poder fijar una fecha histórica
+    # real al reconstruir movimientos desde el Kardex; en la creación manual normal
+    # se comporta igual que auto_now_add (se estampa "ahora" si no se pasa nada).
+    fecha_movimiento = models.DateTimeField(default=timezone.now)
+
+    # Si no es null, este movimiento fue reconstruido automáticamente al
+    # importar el Kardex (historial), no registrado a mano desde la app.
+    # Permite limpiarlos de forma segura en una reimportación sin tocar
+    # jamás los movimientos manuales (que siempre tienen importacion=None).
+    importacion = models.ForeignKey(
+        'ventas.Importacion', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='movimientos_generados',
+    )
 
     class Meta:
         db_table = 'movimiento_inventario'

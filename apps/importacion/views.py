@@ -3,17 +3,24 @@ Microservicio Importación — portado a Django.
 Fuente: Chem Movid backend/importacion/parsers/ y main.py
 
 Estrategia de importación:
-  - Al subir un nuevo archivo del mismo tipo (tipo_informe), se BORRAN los datos
-    anteriores de ese tipo y se reemplazan con los del nuevo archivo.
-  - Esto garantiza que siempre se trabaja con la información más reciente.
+  - Kardex: cada archivo trae solo el periodo nuevo (no el historial completo),
+    así que sus filas se SUMAN al histórico ya importado. Las filas que ya
+    existían de una importación anterior se detectan y se omiten para no
+    duplicar nada si el mismo periodo se sube dos veces por error.
+  - Saldos vs Existencias Mínimas: es una foto del stock físico A HOY, así que
+    cada artículo del archivo actualiza su stock actual/mínimo, generando un
+    movimiento de "Ajuste" que concilia contra el último movimiento conocido
+    (para que el historial de Movimientos siempre cuadre con Stock Actual).
 """
 import io
 import re
 import unicodedata
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
 
 import pandas as pd
 from django.db import transaction
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import serializers
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -21,7 +28,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.auth.permissions import IsAdmin, IsAdminOrInventario
-from apps.inventario.models import Articulo
+from apps.inventario.models import Articulo, MovimientoInventario
 from apps.ventas.models import Importacion, VentaHistorico, SaldoHistorico
 
 
@@ -83,6 +90,17 @@ def _safe_float(val) -> float | None:
         return None
 
 
+def _dec(val: float | None, places: int) -> Decimal | None:
+    """Convierte un float a Decimal redondeado, para comparar contra los campos
+    DecimalField ya guardados en base de datos. Comparar float contra Decimal
+    directamente es poco confiable (ej: 8575.1 == Decimal('8575.10') da False
+    por cómo los binarios de punto flotante representan los decimales), lo que
+    rompe cualquier detección de duplicados basada en esos valores."""
+    if val is None:
+        return None
+    return Decimal(str(round(val, places)))
+
+
 def _parse_fecha(val):
     """Parsea una celda de fecha, ya venga como Timestamp/datetime (Excel la
     tipó como fecha) o como texto 'dd/mm/yyyy'."""
@@ -108,7 +126,8 @@ class ImportacionUploadView(APIView):
     @extend_schema(
         description=(
             'Sube un archivo Excel/CSV de Saldos vs Existencias Mínimas o Kardex. '
-            'Los datos anteriores del mismo tipo se reemplazan automáticamente.'
+            'Los datos se SUMAN al histórico ya importado (no lo reemplazan); '
+            'las filas que ya existían de una importación anterior se omiten.'
         )
     )
     def post(self, request):
@@ -131,18 +150,10 @@ class ImportacionUploadView(APIView):
 
         procesados = 0
         errores = []
+        movimiento_ids = []
+        omitidos = 0
 
         with transaction.atomic():
-            # ── REEMPLAZAR datos anteriores del mismo tipo ─────────────────────
-            importaciones_anteriores = Importacion.objects.filter(tipo_informe=tipo_informe)
-
-            if tipo_informe == 'Informe_Kardex':
-                VentaHistorico.objects.filter(
-                    importacion__in=importaciones_anteriores
-                ).delete()
-                VentaHistorico.objects.filter(importacion__isnull=True).delete()
-                SaldoHistorico.objects.all().delete()
-
             if tipo_informe == 'Informe_Saldos_Existencias_Minimas':
                 # Limpiar artículos con código float antes de reimportar
                 arts_float = Articulo.objects.filter(codigo__regex=r'^\d+\.\d+$')
@@ -159,14 +170,15 @@ class ImportacionUploadView(APIView):
                     except Exception:
                         pass
 
-            importaciones_anteriores.delete()
-
-            # ── Procesar nuevo archivo ─────────────────────────────────────────
+            # ── Procesar nuevo archivo: se SUMA al histórico existente ─────────
+            # (cada Kardex trae solo el periodo nuevo, no el historial completo,
+            # así que ya no se borra nada de importaciones anteriores; los
+            # procesadores se encargan de no duplicar filas ya importadas).
             if tipo_informe == 'Informe_Saldos_Existencias_Minimas':
-                procesados, errores = self._procesar_saldos_existencias_minimas(df)
+                procesados, errores, movimiento_ids = self._procesar_saldos_existencias_minimas(df)
 
             else:  # Informe_Kardex
-                procesados, errores = self._procesar_kardex(df)
+                procesados, errores, movimiento_ids, omitidos = self._procesar_kardex(df)
 
         resultado = 'exito' if not errores else ('parcial' if procesados > 0 else 'error')
         imp = Importacion.objects.create(
@@ -179,18 +191,27 @@ class ImportacionUploadView(APIView):
             reporte_errores=errores or None,
         )
 
-        # Asociar ventas y saldos recién creados a esta importación
+        # Asociar ventas, saldos y movimientos recién creados a esta importación.
+        # importacion__isnull=True solo matchea lo que se acaba de insertar en esta
+        # corrida: lo de importaciones anteriores ya tiene su propio FK puesto, y
+        # los movimientos registrados a mano desde la app nunca se tocan porque se
+        # identifican por id explícito, no por este filtro.
         if tipo_informe == 'Informe_Kardex':
             VentaHistorico.objects.filter(importacion__isnull=True).update(importacion=imp)
             SaldoHistorico.objects.filter(importacion__isnull=True).update(importacion=imp)
 
+        if movimiento_ids:
+            MovimientoInventario.objects.filter(id__in=movimiento_ids).update(importacion=imp)
+
+        mensaje = f'{procesados} registros importados correctamente.'
+        if omitidos:
+            mensaje += f' {omitidos} filas ya existían de una importación anterior y se omitieron.'
+        if errores:
+            mensaje += f' {len(errores)} filas con error.'
+
         return Response({
             **ImportacionSerializer(imp).data,
-            'mensaje': (
-                f'Datos anteriores reemplazados. '
-                f'{procesados} registros importados correctamente.'
-                + (f' {len(errores)} filas con error.' if errores else '')
-            ),
+            'mensaje': mensaje,
         })
 
     # ── Procesadores ──────────────────────────────────────────────────────────
@@ -254,9 +275,12 @@ class ImportacionUploadView(APIView):
                 }
 
         procesados, errores = 0, []
+        ajustes_batch = []
+        momento_import = timezone.now()
+
         for codigo, datos in consolidado.items():
             try:
-                art, _ = Articulo.objects.get_or_create(
+                art, creado = Articulo.objects.get_or_create(
                     codigo=codigo,
                     defaults={
                         'descripcion': datos['nombre'],
@@ -265,7 +289,43 @@ class ImportacionUploadView(APIView):
                         'stock_minimo': datos['existencia_minima'],
                     },
                 )
-                art.stock_actual  = datos['saldo']
+                saldo_nuevo = datos['saldo']
+
+                # Este archivo trae el stock físico real A HOY, pero el Kardex (u otro
+                # ajuste anterior) puede dejar el artículo en un valor distinto — sin un
+                # movimiento que lo explique, el historial no cuadra con Stock Actual.
+                # Si el artículo es nuevo no hay nada que conciliar todavía.
+                if not creado:
+                    ultimo_mov = (
+                        MovimientoInventario.objects
+                        .filter(articulo=art)
+                        .order_by('-fecha_movimiento', '-id')
+                        .first()
+                    )
+                    # Comparar en Decimal, no en float: saldo_nuevo puede venir de
+                    # sumar el saldo de varias bodegas (arrastra ruido de punto
+                    # flotante) y stock_resultante ya es Decimal — comparándolos
+                    # como float aparecían "ajustes" de 0.001 que no eran reales.
+                    stock_esperado = ultimo_mov.stock_resultante if ultimo_mov else _dec(float(art.stock_actual), 3)
+                    saldo_nuevo_dec = _dec(saldo_nuevo, 3)
+                    diferencia = saldo_nuevo_dec - stock_esperado
+                    if abs(diferencia) >= Decimal('0.001'):
+                        ajustes_batch.append(MovimientoInventario(
+                            articulo=art,
+                            tipo_movimiento='ajuste',
+                            cantidad=abs(diferencia),
+                            stock_anterior=stock_esperado,
+                            stock_resultante=saldo_nuevo_dec,
+                            usuario=None,
+                            observaciones=(
+                                'Ajuste automático de conciliación con Informe Saldos vs '
+                                'Existencias Mínimas (stock físico real a la fecha de importación).'
+                            ),
+                            importacion=None,
+                            fecha_movimiento=momento_import,
+                        ))
+
+                art.stock_actual  = saldo_nuevo
                 art.stock_minimo  = datos['existencia_minima']
                 art.descripcion   = datos['nombre']
                 art.save(update_fields=['stock_actual', 'stock_minimo', 'descripcion', 'fecha_modificacion'])
@@ -273,7 +333,21 @@ class ImportacionUploadView(APIView):
             except Exception as e:
                 errores.append({'codigo': codigo, 'error': str(e)})
 
-        return procesados, errores
+        MovimientoInventario.objects.bulk_create(ajustes_batch, batch_size=2000)
+
+        # Mismo problema que con el Kardex: bulk_create vía pymysql no devuelve ids.
+        # Se recuperan por ventana de tiempo (momento_import) en vez de por texto,
+        # porque en una futura reimportación ya podría haber ajustes viejos con el
+        # mismo texto y con importacion=None (al borrarse la Importación anterior,
+        # el FK se pone en null por on_delete=SET_NULL).
+        movimiento_ids = list(
+            MovimientoInventario.objects.filter(
+                importacion__isnull=True,
+                tipo_movimiento='ajuste',
+                fecha_movimiento__gte=momento_import,
+            ).values_list('id', flat=True)
+        )
+        return procesados, errores, movimiento_ids
 
     # Conceptos del Kardex que representan una venta real a cliente (demanda).
     # Se excluyen deliberadamente: "SALDO QUE VIENE" (saldo inicial, no es movimiento),
@@ -296,12 +370,28 @@ class ImportacionUploadView(APIView):
         transacción —sin filtrar por concepto— en SaldoHistorico. Es la única
         fuente que permite reconstruir cómo evolucionó el inventario real mes
         a mes (VentaHistorico solo captura demanda, no existencias).
+
+        También reconstruye cada transacción con entradas/salidas como un
+        MovimientoInventario histórico, para que el Kardex importado se vea
+        en la pantalla de Movimientos junto con los movimientos manuales
+        (marcados con importacion=None para poder distinguirlos siempre).
+
+        Cada archivo trae solo el periodo nuevo (no el historial completo), así
+        que este importador SUMA sus filas al histórico ya existente en vez de
+        reemplazarlo. Para no duplicar nada si el mismo periodo se sube dos
+        veces por error, se compara contra lo que ya hay en base de datos antes
+        de insertar (ventas por artículo+fecha+cantidad+valor, saldos por
+        artículo+fecha+saldo, movimientos por artículo+fecha+observaciones —
+        el texto de observaciones incluye el Doc No, así que es prácticamente
+        único por transacción real).
         """
         header_idx = _encontrar_fila_header(df, {'FECHA', 'CONCEPTO', 'SALDO'})
-        procesados, errores = 0, []
+        procesados, errores, omitidos = 0, [], 0
         codigo_actual, nombre_actual = None, None
         articulos_cache: dict = {}
         saldos_batch = []
+        movimientos_batch = []
+        ultimo_saldo_por_articulo: dict = {}
 
         def _get_articulo(codigo, nombre):
             if codigo not in articulos_cache:
@@ -311,6 +401,20 @@ class ImportacionUploadView(APIView):
                 )
                 articulos_cache[codigo] = art
             return articulos_cache[codigo]
+
+        ventas_existentes = set(
+            VentaHistorico.objects
+            .values_list('articulo__codigo', 'fecha', 'cantidad_vendida', 'valor_total')
+        )
+        saldos_existentes = set(
+            SaldoHistorico.objects
+            .values_list('articulo__codigo', 'fecha', 'saldo')
+        )
+        movimientos_existentes = set(
+            MovimientoInventario.objects
+            .filter(observaciones__startswith='Importado del Kardex —')
+            .values_list('articulo__codigo', 'fecha_movimiento', 'observaciones')
+        )
 
         for i in range(header_idx + 1, len(df)):
             row = df.iloc[i]
@@ -327,6 +431,19 @@ class ImportacionUploadView(APIView):
                     codigo_actual = codigo_raw
                 nombre_raw = str(col2).strip()
                 nombre_actual = re.sub(r'\s+UNI$', '', nombre_raw, flags=re.IGNORECASE).strip() or nombre_raw
+                # Si este artículo ya tiene movimientos de una importación anterior,
+                # se retoma su último saldo conocido en vez de adivinarlo — si no,
+                # la primera transacción de este archivo quedaría con un
+                # stock_anterior estimado en vez del real.
+                if codigo_actual not in ultimo_saldo_por_articulo:
+                    ultimo_mov = (
+                        MovimientoInventario.objects
+                        .filter(articulo__codigo=codigo_actual)
+                        .order_by('-fecha_movimiento', '-id')
+                        .first()
+                    )
+                    if ultimo_mov:
+                        ultimo_saldo_por_articulo[codigo_actual] = float(ultimo_mov.stock_resultante)
                 continue
 
             # ── Filas estructurales: subtotales, encabezados de bodega/grupo ──
@@ -346,18 +463,66 @@ class ImportacionUploadView(APIView):
             # el histórico de existencias reales (no solo de ventas).
             saldo_val = _safe_float(row[6])
             if saldo_val is not None:
-                saldos_batch.append((codigo_actual, nombre_actual, fecha, saldo_val))
+                saldo_key = (codigo_actual, fecha, _dec(saldo_val, 3))
+                if saldo_key not in saldos_existentes:
+                    saldos_batch.append((codigo_actual, nombre_actual, fecha, saldo_val))
+                    saldos_existentes.add(saldo_key)
 
             concepto = str(col3).strip() if pd.notna(col3) else ''
-            if _norm(concepto) not in self.CONCEPTOS_VENTA:
-                continue
-
+            concepto_norm = _norm(concepto)
+            doc_no = str(col2).strip() if pd.notna(col2) else ''
+            entradas = _safe_float(row[4]) or 0
             salidas = _safe_float(row[5]) or 0
+
+            # ── Reconstruir como movimiento histórico (independiente de si es venta) ──
+            if saldo_val is not None and (entradas > 0 or salidas > 0):
+                if 'CREACION DE KITS' in concepto_norm:
+                    tipo_mov = 'produccion_kit'
+                elif 'AJUSTE' in concepto_norm:
+                    tipo_mov = 'ajuste'
+                elif entradas > 0:
+                    tipo_mov = 'entrada'
+                else:
+                    tipo_mov = 'salida'
+                cantidad_mov = entradas if entradas > 0 else salidas
+
+                anterior = ultimo_saldo_por_articulo.get(codigo_actual)
+                if anterior is None:
+                    # Sin historial previo ni en este archivo ni en la base: se
+                    # estima el saldo previo restando/sumando esta misma cantidad.
+                    anterior = saldo_val - cantidad_mov if tipo_mov != 'salida' else saldo_val + cantidad_mov
+
+                observaciones = f"Importado del Kardex — Doc {doc_no or 's/n'}, {concepto}"
+                fecha_aware = timezone.make_aware(datetime.combine(fecha, datetime.min.time()))
+                mov_key = (codigo_actual, fecha_aware, observaciones)
+                if mov_key in movimientos_existentes:
+                    omitidos += 1
+                else:
+                    movimientos_existentes.add(mov_key)
+                    movimientos_batch.append({
+                        'codigo': codigo_actual, 'nombre': nombre_actual, 'fecha': fecha,
+                        'tipo': tipo_mov, 'cantidad': cantidad_mov,
+                        'stock_anterior': anterior, 'stock_resultante': saldo_val,
+                        'observaciones': observaciones,
+                    })
+
+            if saldo_val is not None:
+                ultimo_saldo_por_articulo[codigo_actual] = saldo_val
+
+            # ── Ventas (histórico de demanda para pronósticos) ──
+            if concepto_norm not in self.CONCEPTOS_VENTA:
+                continue
             if salidas <= 0:
                 continue
 
             valor = _safe_float(row[7])
             valor_abs = abs(valor) if valor is not None else None
+
+            venta_key = (codigo_actual, fecha, _dec(salidas, 3), _dec(valor_abs, 2))
+            if venta_key in ventas_existentes:
+                omitidos += 1
+                continue
+            ventas_existentes.add(venta_key)
 
             try:
                 art = _get_articulo(codigo_actual, nombre_actual)
@@ -378,7 +543,35 @@ class ImportacionUploadView(APIView):
         ]
         SaldoHistorico.objects.bulk_create(saldo_objs, batch_size=2000)
 
-        return procesados, errores
+        mov_objs = [
+            MovimientoInventario(
+                articulo=_get_articulo(m['codigo'], m['nombre']),
+                tipo_movimiento=m['tipo'],
+                cantidad=m['cantidad'],
+                stock_anterior=m['stock_anterior'],
+                stock_resultante=m['stock_resultante'],
+                usuario=None,
+                observaciones=m['observaciones'],
+                importacion=None,
+                fecha_movimiento=timezone.make_aware(datetime.combine(m['fecha'], datetime.min.time())),
+            )
+            for m in movimientos_batch
+        ]
+        MovimientoInventario.objects.bulk_create(mov_objs, batch_size=2000)
+
+        # MySQL vía pymysql no devuelve los ids generados en bulk_create, así que
+        # no podemos usar los objetos de `mov_objs` para identificar qué filas son
+        # de esta importación. Como ya no se borran las Importaciones anteriores,
+        # los movimientos de corridas previas siempre tienen su importacion_id ya
+        # puesto — importacion__isnull=True solo puede matchear lo recién
+        # insertado acá (los movimientos manuales usan otro texto en observaciones).
+        movimiento_ids = list(
+            MovimientoInventario.objects.filter(
+                importacion__isnull=True,
+                observaciones__startswith='Importado del Kardex —',
+            ).values_list('id', flat=True)
+        )
+        return procesados, errores, movimiento_ids, omitidos
 
 
 # ── Vistas auxiliares ──────────────────────────────────────────────────────────
