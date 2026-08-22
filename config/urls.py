@@ -25,12 +25,10 @@ urlpatterns = [
 
     # Microservicio: Auditoría
     path('api/auditoria/', include('apps.auditoria.urls')),
-<<<<<<< HEAD
-    #Micriservicio: Costos
-    path('api/costos/', include('apps.costos_productos.urls')),
-=======
 
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
+    # Microservicio: Costos
+    path('api/costos/', include('apps.costos_productos.urls')),
+
     # Documentación OpenAPI
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/swagger/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),

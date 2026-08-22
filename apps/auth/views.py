@@ -331,8 +331,4 @@ class ResetPasswordView(APIView):
         registrar_evento('RESET_PASSWORD', f'Contraseña restablecida usuario {usuario_id}',
                          usuario_id=usuario_id, entidad='usuario', entidad_id=usuario_id,
                          ip=_get_client_ip(request))
-<<<<<<< HEAD
         return Response({'message': 'Contraseña restablecida exitosamente'})
-=======
-        return Response({'message': 'Contraseña restablecida exitosamente'})
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790

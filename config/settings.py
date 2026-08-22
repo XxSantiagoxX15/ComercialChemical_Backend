@@ -11,13 +11,8 @@ from django.core.exceptions import ImproperlyConfigured
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
-<<<<<<< HEAD
-##DEBUG = os.environ.get('DEBUG', 'False') == 'True'
-DEBUG = 'TRUE'
-=======
 DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
     if DEBUG:
@@ -44,10 +39,7 @@ INSTALLED_APPS = [
     'channels',
 
     # Apps del proyecto
-<<<<<<< HEAD
     'apps.costos_productos.apps.CostosProductosConfig',
-=======
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
     'apps.auth.apps.AuthConfig',
     'apps.inventario.apps.InventarioConfig',
     'apps.compras.apps.ComprasConfig',
@@ -92,15 +84,9 @@ ASGI_APPLICATION = 'config.asgi.application'  # Para WebSockets (alertas de stoc
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-<<<<<<< HEAD
-        'NAME': os.environ.get('DB_NAME', 'comercial_chemical_db'),
-        'USER': os.environ.get('DB_USER', 'root'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'admin123'),
-=======
         'NAME': os.environ.get('DB_NAME', 'chem_modinv_db'),
         'USER': os.environ.get('DB_USER', 'root'),
         'PASSWORD': os.environ.get('DB_PASSWORD', '12345'),
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
         'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
@@ -110,10 +96,6 @@ DATABASES = {
     }
 }
 
-<<<<<<< HEAD
-
-=======
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
 # ─── Channel Layers (WebSocket para alertas stock) ────────────────────────────
 CHANNEL_LAYERS = {
     'default': {
@@ -160,15 +142,10 @@ SIMPLE_JWT = {
 }
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:4200",
-    "http://127.0.0.1:4200",
-]
-<<<<<<< HEAD
-CORS_ALLOW_ALL_ORIGINS = os.getenv("CORS_ALLOW_ALL_ORIGINS", "True") == "True"
-=======
+CORS_ALLOWED_ORIGINS = os.environ.get(
+    'CORS_ALLOWED_ORIGINS', 'http://localhost:4200,http://127.0.0.1:4200'
+).split(',')
 CORS_ALLOW_ALL_ORIGINS = DEBUG
->>>>>>> 4cc41a2f222638035a5a565a4f6c56f3f6449790
 CORS_ALLOW_CREDENTIALS = True
 
 # ─── Localización ─────────────────────────────────────────────────────────────
