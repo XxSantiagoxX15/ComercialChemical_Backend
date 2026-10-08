@@ -2,6 +2,7 @@
 CHEM-MODINV — Django Settings
 Backend unificado con la lógica de microservicios de Chem Movid.
 """
+import sys
 import os
 from pathlib import Path
 from datetime import timedelta
@@ -54,6 +55,7 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'apps.auth.cifrado.CifradoMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -147,7 +149,8 @@ CORS_ALLOWED_ORIGINS = os.environ.get(
 ).split(',')
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 CORS_ALLOW_CREDENTIALS = True
-
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = (*default_headers, 'x-canal', 'x-canal-consulta')
 # ─── Localización ─────────────────────────────────────────────────────────────
 LANGUAGE_CODE = 'es-co'
 TIME_ZONE = 'America/Bogota'
@@ -207,3 +210,13 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:4200').rstrip('/
 
 # Minutos de validez del código para restablecer la contraseña.
 PASSWORD_RESET_CODE_MINUTES = int(os.environ.get('PASSWORD_RESET_CODE_MINUTES', '15'))
+
+CIFRADO_ACTIVO = os.environ.get('CIFRADO_ACTIVO', 'True') == 'True'
+if 'test' in sys.argv:
+    CIFRADO_ACTIVO = False
+
+# Prefijos de las rutas cifradas. Activar un módulo = agregar aquí su prefijo.
+# El frontend lee esta lista del backend; no hay que tocarlo.
+CIFRADO_RUTAS = [
+    '/api/',
+]

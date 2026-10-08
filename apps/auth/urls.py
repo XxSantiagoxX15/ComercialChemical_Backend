@@ -1,4 +1,5 @@
 from django.urls import path
+from .cifrado import CanalView
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     HealthView, LoginView, LogoutView, MeView,
@@ -7,6 +8,7 @@ from .views import (
 
 urlpatterns = [
     path('health/', HealthView.as_view()),
+    path('canal/', CanalView.as_view()),
     path('login/', LoginView.as_view()),
     path('logout/', LogoutView.as_view()),
     path('refresh/', TokenRefreshView.as_view()),

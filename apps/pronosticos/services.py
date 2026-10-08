@@ -55,12 +55,13 @@ def _ajustar_y_pronosticar(valores: np.ndarray, modelo: str, periodos: int) -> t
     if modelo == 'suavizacion_exponencial':
         if n >= 12:
             from statsmodels.tsa.holtwinters import ExponentialSmoothing
-            fit = ExponentialSmoothing(valores, trend='add', seasonal=None).fit()
+            fit = ExponentialSmoothing(
+                valores, trend='add', seasonal=None, initialization_method='estimated').fit()
             forecast = np.maximum(fit.forecast(periodos), 0)
             params = {'alpha': round(float(fit.params.get('smoothing_level', 0)), 4), 'metodo': 'Holt-Winters'}
         elif n >= 3:
             from statsmodels.tsa.holtwinters import SimpleExpSmoothing
-            fit = SimpleExpSmoothing(valores).fit(optimized=True)
+            fit = SimpleExpSmoothing(valores, initialization_method='estimated').fit(optimized=True)
             forecast = np.maximum(fit.forecast(periodos), 0)
             params = {'alpha': round(float(fit.params.get('smoothing_level', 0)), 4), 'metodo': 'Simple'}
         elif n == 2:
