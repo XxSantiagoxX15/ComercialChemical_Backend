@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ asunto }}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f0f2f8;">
+  <!-- Texto que algunos clientes muestran junto al asunto -->
+  <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:#f0f2f8;">{% block resumen %}{% endblock %}</div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f0f2f8;">
+    <tr>
+      <td align="center" style="padding:32px 12px;">
+
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="width:560px; max-width:100%; background-color:#ffffff; border-radius:14px; overflow:hidden; border:1px solid #e3e6f0;">
+          <tr>
+            <td style="height:5px; line-height:5px; font-size:0; background-color:#1a237e;">&nbsp;</td>
+          </tr>
+
+          <!-- Encabezado: logo de la empresa -->
+          <tr>
+            <td align="center" style="padding:28px 40px 8px;">
+              {% if con_logo %}
+                <img src="cid:logo" width="124" alt="Comercial Chemical" style="display:block; width:124px; height:auto; border:0;">
+              {% else %}
+                <div style="font-family:Georgia,'Times New Roman',serif; font-size:20px; letter-spacing:3px; color:#111827;">COMERCIAL CHEMICAL</div>
+              {% endif %}
+              <div style="font-family:Arial,Helvetica,sans-serif; font-size:11px; font-weight:bold; letter-spacing:2.5px; color:#3949ab; padding-top:10px;">{{ sistema }}</div>
+            </td>
+          </tr>
+
+          <!-- Contenido -->
+          <tr>
+            <td style="padding:16px 40px 34px; font-family:Arial,Helvetica,sans-serif; font-size:15px; line-height:1.6; color:#37474f;">
+              {% block contenido %}{% endblock %}
+            </td>
+          </tr>
+
+          <!-- Pie -->
+          <tr>
+            <td style="padding:18px 40px 22px; background-color:#f7f8fc; border-top:1px solid #e3e6f0; font-family:Arial,Helvetica,sans-serif; font-size:12px; line-height:1.5; color:#8a94a6;" align="center">
+              Mensaje automático de {{ sistema }}, el sistema de inventarios de {{ empresa }}<br>
+              No respondas a este correo.
+            </td>
+          </tr>
+        </table>
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

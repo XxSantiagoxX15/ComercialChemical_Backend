@@ -11,7 +11,7 @@ from django.core.exceptions import ImproperlyConfigured
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
 
-DEBUG = os.environ.get('DEBUG', 'False') == 'True'
+DEBUG = os.environ.get('DEBUG', 'False') == 'False'
 
 SECRET_KEY = os.environ.get('SECRET_KEY')
 if not SECRET_KEY:
@@ -84,9 +84,9 @@ ASGI_APPLICATION = 'config.asgi.application'  # Para WebSockets (alertas de stoc
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('DB_NAME', 'chem_modinv_db'),
+        'NAME': os.environ.get('DB_NAME', 'comercial_chemical_db'),
         'USER': os.environ.get('DB_USER', 'root'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', '12345'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'admin123'),
         'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
         'PORT': os.environ.get('DB_PORT', '3306'),
         'OPTIONS': {
@@ -174,3 +174,36 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
 }
+
+# ── Correo ───────────────────────────────────────────────────────────────────
+# Se usa para el correo de bienvenida y para el código de restablecer contraseña.
+# Sin EMAIL_HOST en el .env los correos NO se envían: se imprimen en la consola
+# del servidor, que es lo cómodo para desarrollar (ahí se ve el código).
+EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
+EMAIL_BACKEND = os.environ.get(
+    'EMAIL_BACKEND',
+    'django.core.mail.backends.smtp.EmailBackend' if EMAIL_HOST
+    else 'django.core.mail.backends.console.EmailBackend',
+)
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
+EMAIL_TIMEOUT = 15
+DEFAULT_FROM_EMAIL = os.environ.get(
+    'DEFAULT_FROM_EMAIL',
+    f"CHEM-MODINV <{EMAIL_HOST_USER or 'no-responder@comercialchemical.local'}>",
+)
+
+# Dirección del frontend. Los botones de los correos enlazan a ella:
+#   bienvenida -> {FRONTEND_URL}/login
+#   código     -> {FRONTEND_URL}/recuperar?correo=...
+# En desarrollo el frontend corre en http://localhost:4200 (ng serve), que es
+# el valor por defecto. "localhost" solo funciona en este mismo computador:
+# quien abra el correo en otro equipo o en el celular no podrá usar el botón.
+# Al publicar el sistema, definir FRONTEND_URL en el .env con la dirección real.
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:4200').rstrip('/')
+
+# Minutos de validez del código para restablecer la contraseña.
+PASSWORD_RESET_CODE_MINUTES = int(os.environ.get('PASSWORD_RESET_CODE_MINUTES', '15'))

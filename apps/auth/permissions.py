@@ -1,44 +1,73 @@
 """
-Permisos RBAC — portados de shared/jwt_middleware.py del Chem Movid.
-Se usan en todas las apps del proyecto.
+Permisos del proyecto.
+
+Las clases conservan sus nombres porque todas las apps las importan, pero ya
+no deciden solo por el nombre del rol: primero miran si la ruta pedida está
+gobernada por un módulo (modulos.ACCESO_POR_RUTA) y, si lo está, dejan pasar
+a quien tenga ese módulo activo en la tabla permiso_rol. Si la ruta no está
+en ese mapa, se comportan como siempre (por nombre de rol).
+
+El Administrador pasa siempre.
 """
 from rest_framework.permissions import BasePermission
 
+from .modulos import ROL_ADMIN, modulos_de_ruta
+
+
+def _usuario(request):
+    """request.user cuando viene de ChemJWTAuthentication; si no, None."""
+    user = getattr(request, 'user', None)
+    return user if getattr(user, 'usuario', None) is not None else None
+
 
 def _get_rol(request):
-    """Extrae el nombre del rol del token JWT."""
-    # Primero intenta desde request.auth (token directo)
-    token = getattr(request, 'auth', None)
-    if token and hasattr(token, 'get'):
-        rol = token.get('rol')
-        if rol:
-            return rol
-    # Luego intenta desde request.user (ChemJWTAuthentication)
-    user = getattr(request, 'user', None)
-    if user and hasattr(user, 'rol'):
-        return user.rol
-    return None
+    """Nombre del rol actual del usuario autenticado (leído de la base)."""
+    user = _usuario(request)
+    return user.rol if user else None
 
+def _campos_enviados(request):
+    """Nombres de los campos del cuerpo de la petición (vacío en un GET)."""
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return []
+    try:
+        return list(request.data.keys())
+    except Exception:
+        return []
+class _PermisoPorModulo(BasePermission):
+    # Roles (además del Administrador) que pasan cuando la ruta NO está
+    # gobernada por módulos: el comportamiento original de cada clase.
+    roles_sin_modulo = ()
+    message = 'Tu rol no tiene acceso a este módulo.'
 
-class IsAdmin(BasePermission):
-    """Solo Administrador."""
     def has_permission(self, request, view):
-        return _get_rol(request) == 'Administrador'
+        user = _usuario(request)
+        if user is None:
+            return False
+        if user.es_admin:
+            return True
+        modulos = modulos_de_ruta(request.method, request.path_info, _campos_enviados(request))
+        if modulos is None:
+            return user.rol in self.roles_sin_modulo
+        return user.tiene_modulo(*modulos)
 
 
-class IsAdminOrInventario(BasePermission):
-    """Administrador o Analista_Inventarios."""
-    def has_permission(self, request, view):
-        return _get_rol(request) in ('Administrador', 'Analista_Inventarios')
+class IsAdmin(_PermisoPorModulo):
+    """Solo Administrador, salvo en rutas que el mapa asigna a un módulo
+    (historial de importación y auditoría)."""
+    roles_sin_modulo = ()
 
 
-class IsAdminOrCompras(BasePermission):
-    """Administrador o Responsable_Compras."""
-    def has_permission(self, request, view):
-        return _get_rol(request) in ('Administrador', 'Responsable_Compras')
+class IsAdminOrInventario(_PermisoPorModulo):
+    """Según el módulo de la ruta; fuera del mapa, Administrador o Analista."""
+    roles_sin_modulo = ('Analista_Inventarios',)
+
+
+class IsAdminOrCompras(_PermisoPorModulo):
+    """Según el módulo de la ruta; fuera del mapa, Administrador o Compras."""
+    roles_sin_modulo = ('Responsable_Compras',)
 
 
 class IsAuthenticated(BasePermission):
-    """Cualquier rol autenticado."""
+    """Cualquier usuario activo del sistema."""
     def has_permission(self, request, view):
-        return _get_rol(request) in ('Administrador', 'Analista_Inventarios', 'Responsable_Compras')
+        return _usuario(request) is not None

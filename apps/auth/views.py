@@ -5,6 +5,7 @@ Fuente: Chem Movid backend/auth/main.py
 import uuid
 import bcrypt
 import logging
+from rest_framework.throttling import AnonRateThrottle
 from datetime import datetime, timezone, timedelta
 
 from django.conf import settings
@@ -14,13 +15,23 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
-
-from .models import Usuario, Rol, SesionJWT
+from django.db import transaction
+from .models import Usuario, Rol, SesionJWT, PermisoRol
 from .serializers import (
     LoginSerializer, UsuarioSerializer, CrearUsuarioSerializer,
-    ActualizarUsuarioSerializer, ResetPasswordSerializer
+    ActualizarUsuarioSerializer, ResetPasswordSerializer, RolSerializer,
+    SolicitarCodigoSerializer, RestablecerPasswordSerializer,
+)
+from .correos import enviar_bienvenida, enviar_codigo_recuperacion
+from .recuperacion import (
+    consumir_codigo, descartar_codigos, generar_codigo, minutos_validez,
+    segundos_para_reenviar,
 )
 from .permissions import IsAdmin
+from .modulos import (
+    ROL_ADMIN, MODULOS_SOLO_ADMIN, todos_los_modulos, modulos_de_rol,
+    inicializar_permisos,
+)
 from apps.auditoria.services import registrar_evento
 
 logger = logging.getLogger(__name__)
@@ -46,82 +57,81 @@ class RolListView(APIView):
     permission_classes = [IsAdmin]
 
     def get(self, request):
-        roles = Rol.objects.all()
-        from .serializers import RolSerializer
-        return Response(RolSerializer(roles, many=True).data)
+        return Response(RolSerializer(Rol.objects.all(), many=True).data)
 
 
 class PermisosRolView(APIView):
-    """GET /api/auth/permisos/ → todos los permisos por rol
-       PUT /api/auth/permisos/ → actualizar permisos de un rol"""
+    """GET /api/auth/permisos/ → módulos activos de cada rol
+       PUT /api/auth/permisos/ → actualizar los módulos de un rol
+
+    Lo que se guarda aquí es lo que el backend exige en cada endpoint
+    (permissions.requiere_modulo) y lo que el frontend usa para armar el menú."""
     permission_classes = [IsAdmin]
 
-    MODULOS_DEFAULT = {
-        'Administrador': [
-            'dashboard','inventario_articulos','inventario_movimientos',
-            'inventario_alertas','compras','pronosticos',
-            'importacion','auditoria','usuarios'
-        ],
-        'Analista_Inventarios': [
-            'dashboard','inventario_articulos','inventario_movimientos',
-            'inventario_alertas','pronosticos'
-        ],
-        'Responsable_Compras': [
-            'dashboard','compras','inventario_alertas','pronosticos'
-        ],
-    }
-
-    def _inicializar_permisos(self):
-        """Crea los permisos por defecto si no existen."""
-        from .models import PermisoRol
-        todos_modulos = [m[0] for m in PermisoRol.MODULOS]
-        for rol in Rol.objects.all():
-            defaults = self.MODULOS_DEFAULT.get(rol.nombre, [])
-            for modulo in todos_modulos:
-                PermisoRol.objects.get_or_create(
-                    rol=rol, modulo=modulo,
-                    defaults={'activo': modulo in defaults}
-                )
-
     def get(self, request):
-        from .models import PermisoRol
-        self._inicializar_permisos()
-        roles = Rol.objects.prefetch_related('permisos').all()
+        inicializar_permisos()
         resultado = []
-        for rol in roles:
-            permisos = {p.modulo: p.activo for p in rol.permisos.all()}
+        for rol in Rol.objects.all().order_by('id'):
+            activos = modulos_de_rol(rol)
             resultado.append({
                 'rol_id': rol.id,
                 'rol_nombre': rol.nombre,
                 'descripcion': rol.descripcion,
-                'permisos': permisos,
+                'permisos': {m: m in activos for m in todos_los_modulos()},
+                # Módulos que no se pueden cambiar para este rol (la pantalla
+                # de permisos los muestra bloqueados).
+                'modulos_bloqueados': (
+                    todos_los_modulos() if rol.nombre == ROL_ADMIN
+                    else sorted(MODULOS_SOLO_ADMIN)
+                ),
             })
         return Response(resultado)
 
     def put(self, request):
-        from .models import PermisoRol
-        rol_id  = request.data.get('rol_id')
-        permisos = request.data.get('permisos', {})
+        rol_id = request.data.get('rol_id')
+        permisos = request.data.get('permisos')
         try:
             rol = Rol.objects.get(id=rol_id)
-        except Rol.DoesNotExist:
+        except (Rol.DoesNotExist, ValueError, TypeError):
             return Response({'error': 'Rol no encontrado'}, status=404)
-        if rol.nombre == 'Administrador':
+        if rol.nombre == ROL_ADMIN:
             return Response({'error': 'No se pueden modificar los permisos del Administrador'}, status=400)
-        for modulo, activo in permisos.items():
-            PermisoRol.objects.update_or_create(
-                rol=rol, modulo=modulo,
-                defaults={'activo': bool(activo)}
-            )
+        if not isinstance(permisos, dict) or not permisos:
+            return Response({'error': 'Envía "permisos" como un objeto {modulo: true/false}.'}, status=400)
+
+        catalogo = set(todos_los_modulos())
+        desconocidos = sorted(set(permisos) - catalogo)
+        if desconocidos:
+            return Response({'error': f"Módulos desconocidos: {', '.join(desconocidos)}"}, status=400)
+        no_booleanos = sorted(m for m, v in permisos.items() if not isinstance(v, bool))
+        if no_booleanos:
+            return Response({'error': f"El valor debe ser true o false en: {', '.join(no_booleanos)}"}, status=400)
+        reservados = sorted(m for m, v in permisos.items() if v and m in MODULOS_SOLO_ADMIN)
+        if reservados:
+            return Response(
+                {'error': f"Solo el Administrador puede tener: {', '.join(reservados)}"}, status=400)
+
+        antes = sorted(modulos_de_rol(rol))
+        with transaction.atomic():
+            for modulo, activo in permisos.items():
+                PermisoRol.objects.update_or_create(
+                    rol=rol, modulo=modulo, defaults={'activo': activo})
+        despues = sorted(modulos_de_rol(rol))
+
         registrar_evento(
             'ACTUALIZAR_PERMISOS',
             f'Permisos del rol {rol.nombre} actualizados',
-            usuario_id=request.auth.get('usuario_id') if request.auth else None,
-            entidad='rol', entidad_id=rol_id,
+            usuario_id=request.user.id,
+            entidad='rol', entidad_id=rol.id,
+            datos_anteriores={'modulos': antes},
+            datos_nuevos={'modulos': despues},
             ip=_get_client_ip(request),
         )
-        return Response({'message': f'Permisos de {rol.nombre} actualizados'})
-
+        return Response({
+            'message': f'Permisos de {rol.nombre} actualizados',
+            'rol_id': rol.id,
+            'permisos': {m: m in despues for m in todos_los_modulos()},
+        })
 
 class HealthView(APIView):
     permission_classes = []
@@ -218,6 +228,7 @@ class LoginView(APIView):
                 'nombre_completo': usuario.nombre_completo,
                 'email': usuario.email,
                 'rol': usuario.rol.nombre,
+                'modulos': sorted(modulos_de_rol(usuario.rol)),
             }
         })
 
@@ -239,18 +250,102 @@ class LogoutView(APIView):
 
 
 class MeView(APIView):
+    """Perfil del usuario autenticado con su rol y módulos ACTUALES. El
+    frontend lo consulta al cargar para armar el menú, de modo que un cambio
+    de permisos se refleja sin tener que volver a iniciar sesión."""
+
     def get(self, request):
-        token = request.auth
-        if not token:
-            return Response({'error': 'No autenticado'}, status=401)
-        usuario_id = token.get('usuario_id')
-        try:
-            usuario = Usuario.objects.select_related('rol').get(id=usuario_id)
-        except Usuario.DoesNotExist:
-            return Response({'error': 'Usuario no encontrado'}, status=404)
-        return Response(UsuarioSerializer(usuario).data)
+        usuario = request.user.usuario
+        data = UsuarioSerializer(usuario).data
+        data['modulos'] = sorted(request.user.modulos)
+        data['es_admin'] = request.user.es_admin
+        return Response(data)
+
+# ── Recuperación de contraseña con código enviado al correo ──────────────────
+
+class LimiteRecuperacion(AnonRateThrottle):
+    """Frena el abuso de los endpoints públicos de recuperación (por IP)."""
+    scope = 'recuperacion_password'
+    rate = '10/min'
 
 
+class SolicitarCodigoPasswordView(APIView):
+    """POST /api/auth/password/codigo/  {"correo": "..."}
+
+    Envía al correo un código de un solo uso para restablecer la contraseña.
+    Es público (lo usa «¿Olvidaste tu contraseña?» en el login) y responde
+    siempre lo mismo, exista o no el correo, para no revelar qué cuentas hay."""
+    authentication_classes = []
+    permission_classes = []
+    throttle_classes = [LimiteRecuperacion]
+
+    @extend_schema(request=SolicitarCodigoSerializer)
+    def post(self, request):
+        serializer = SolicitarCodigoSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+
+        correo = serializer.validated_data['correo']
+        usuario = (
+            Usuario.objects.select_related('rol')
+            .filter(email__iexact=correo, activo=True).first()
+        )
+        # Solo se envía si la cuenta existe, está activa y no se le mandó otro
+        # código hace menos de un minuto.
+        if usuario is not None and segundos_para_reenviar(usuario) == 0:
+            codigo = generar_codigo(usuario)
+            if enviar_codigo_recuperacion(usuario, codigo, minutos_validez()):
+                registrar_evento(
+                    'SOLICITAR_CODIGO_PASSWORD',
+                    f'Código para restablecer contraseña enviado a {usuario.email}',
+                    usuario_id=usuario.id, entidad='usuario', entidad_id=usuario.id,
+                    ip=_get_client_ip(request),
+                )
+            else:
+                descartar_codigos(usuario)
+
+        return Response({
+            'message': 'Si el correo está registrado, enviamos un código para restablecer la contraseña.',
+            'minutos_validez': minutos_validez(),
+        })
+
+
+class RestablecerPasswordView(APIView):
+    """POST /api/auth/password/restablecer/
+       {"correo": "...", "codigo": "123456", "nueva_password": "..."}
+
+    Cambia la contraseña si el código es el vigente de esa cuenta."""
+    authentication_classes = []
+    permission_classes = []
+    throttle_classes = [LimiteRecuperacion]
+
+    @extend_schema(request=RestablecerPasswordSerializer)
+    def post(self, request):
+        serializer = RestablecerPasswordSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
+
+        d = serializer.validated_data
+        usuario = Usuario.objects.filter(email__iexact=d['correo'], activo=True).first()
+        if usuario is None or not consumir_codigo(usuario, d['codigo']):
+            return Response(
+                {'error': 'El código no es válido o ya venció. Solicita uno nuevo.'}, status=400)
+
+        usuario.password_hash = _hash_password(d['nueva_password'])
+        # Quien demuestra tener acceso al correo recupera la cuenta aunque
+        # estuviera bloqueada por intentos fallidos.
+        usuario.intentos_fallidos = 0
+        usuario.bloqueado_hasta = None
+        usuario.save(update_fields=[
+            'password_hash', 'intentos_fallidos', 'bloqueado_hasta', 'fecha_modificacion'])
+        SesionJWT.objects.filter(usuario=usuario).delete()
+
+        registrar_evento(
+            'RESET_PASSWORD', f'Contraseña restablecida con código por {usuario.email}',
+            usuario_id=usuario.id, entidad='usuario', entidad_id=usuario.id,
+            ip=_get_client_ip(request),
+        )
+        return Response({'message': 'Contraseña actualizada. Ya puedes iniciar sesión.'})
 class UsuarioListView(APIView):
     permission_classes = [IsAdmin]
 
@@ -280,7 +375,10 @@ class UsuarioListView(APIView):
             entidad_id=usuario.id,
             ip=_get_client_ip(request),
         )
-        return Response(UsuarioSerializer(usuario).data, status=201)
+        correo_enviado = enviar_bienvenida(usuario)
+        data = UsuarioSerializer(usuario).data
+        data['correo_enviado'] = correo_enviado
+        return Response(data, status=201)
 
 
 class UsuarioDetailView(APIView):
@@ -315,20 +413,42 @@ class UsuarioDetailView(APIView):
 
 
 class ResetPasswordView(APIView):
+    """POST /api/auth/usuarios/<id>/reset-password/
+
+    El Administrador ya no escribe la contraseña de otra persona: este
+    endpoint le envía al usuario un código a su correo para que él mismo
+    defina la nueva en la pantalla de recuperación."""
     permission_classes = [IsAdmin]
 
     def post(self, request, usuario_id):
-        serializer = ResetPasswordSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=400)
         try:
-            usuario = Usuario.objects.get(id=usuario_id)
+            usuario = Usuario.objects.select_related('rol').get(id=usuario_id)
         except Usuario.DoesNotExist:
             return Response({'error': 'Usuario no encontrado'}, status=404)
+        if not usuario.activo:
+            return Response(
+                {'error': 'El usuario está inactivo. Actívalo antes de restablecer su contraseña.'},
+                status=400)
 
-        usuario.password_hash = _hash_password(serializer.validated_data['nueva_password'])
-        usuario.save(update_fields=['password_hash', 'fecha_modificacion'])
-        registrar_evento('RESET_PASSWORD', f'Contraseña restablecida usuario {usuario_id}',
-                         usuario_id=usuario_id, entidad='usuario', entidad_id=usuario_id,
+        espera = segundos_para_reenviar(usuario)
+        if espera > 0:
+            return Response(
+                {'error': f'Ya se le envió un código hace un momento. Espera {espera} segundos para enviar otro.'},
+                status=429)
+
+        codigo = generar_codigo(usuario)
+        if not enviar_codigo_recuperacion(usuario, codigo, minutos_validez(), solicitado_por_admin=True):
+            descartar_codigos(usuario)
+            return Response(
+                {'error': 'No se pudo enviar el correo. Revisa la configuración de correo del servidor.'},
+                status=502)
+
+        registrar_evento('RESET_PASSWORD_SOLICITADO',
+                         f'Código para restablecer contraseña enviado a {usuario.email}',
+                         usuario_id=request.user.id, entidad='usuario', entidad_id=usuario.id,
                          ip=_get_client_ip(request))
-        return Response({'message': 'Contraseña restablecida exitosamente'})
+        return Response({
+            'message': f'Se envió un código a {usuario.email}.',
+            'correo': usuario.email,
+            'minutos_validez': minutos_validez(),
+        })

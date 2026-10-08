@@ -26,6 +26,7 @@ class PermisoRol(models.Model):
     MODULOS = [
         ('dashboard',             'Dashboard'),
         ('inventario_articulos',  'Inventario - Artículos'),
+        ('calculadora_precios', 'Calculadora de precios'),
         ('inventario_movimientos','Inventario - Movimientos'),
         ('inventario_alertas',    'Inventario - Alertas'),
         ('compras',               'Compras'),
@@ -75,3 +76,22 @@ class SesionJWT(models.Model):
     class Meta:
         db_table = 'sesion_jwt'
         verbose_name = 'Sesión JWT'
+
+
+class CodigoRecuperacion(models.Model):
+    """Código de un solo uso que se envía al correo para restablecer la
+    contraseña. Solo se guarda su huella (nunca el código), vence a los pocos
+    minutos y se invalida tras varios intentos fallidos."""
+    usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE, related_name='codigos_recuperacion')
+    codigo_hash = models.CharField(max_length=64)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_expiracion = models.DateTimeField()
+    intentos = models.PositiveSmallIntegerField(default=0)
+    usado = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = 'codigo_recuperacion'
+        verbose_name = 'Código de recuperación'
+
+    def __str__(self):
+        return f"Código de {self.usuario.email} (vence {self.fecha_expiracion:%Y-%m-%d %H:%M})"

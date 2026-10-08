@@ -54,3 +54,12 @@ class ActualizarUsuarioSerializer(serializers.Serializer):
 
 class ResetPasswordSerializer(serializers.Serializer):
     nueva_password = serializers.CharField(min_length=6)
+class SolicitarCodigoSerializer(serializers.Serializer):
+    correo = serializers.EmailField()
+
+
+class RestablecerPasswordSerializer(serializers.Serializer):
+    correo = serializers.EmailField()
+    codigo = serializers.RegexField(
+        r'^\d{6}$', error_messages={'invalid': 'El código tiene 6 dígitos.'})
+    nueva_password = serializers.CharField(min_length=6, write_only=True)

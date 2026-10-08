@@ -9,7 +9,11 @@ from django.db.models import F, Q, ExpressionWrapper, FloatField, Sum, Value, De
 from django.db.models.functions import Coalesce
 from rest_framework.exceptions import ValidationError
 from .models import Articulo, MovimientoInventario, Kit, KitComponente, LoteInventario
+def _a_booleano(valor) -> bool:
 
+    if isinstance(valor, str):
+        return valor.strip().lower() in ('true', '1', 'si', 'sí', 'on')
+    return bool(valor)
 
 class ArticuloService:
 
@@ -65,10 +69,13 @@ class ArticuloService:
             campos.append('ficha_seguridad')
         for campo in campos:
             if campo in data:
-                setattr(articulo, campo, data[campo])
+                valor = data[campo]
+                if campo in ('activo', 'alerta_ignorada'):
+                    valor = _a_booleano(valor)
+                setattr(articulo, campo, valor)
         if 'alerta_ignorada' in data:
             from django.utils import timezone
-            articulo.fecha_alerta_ignorada = timezone.now() if data['alerta_ignorada'] else None
+            articulo.fecha_alerta_ignorada = timezone.now() if articulo.alerta_ignorada else None
         articulo.save()
         return articulo
 
